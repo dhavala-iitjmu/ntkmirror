@@ -1,0 +1,5 @@
+{"prompt":"Problem: 14 + 27 = ?\nSolution:","completion":" Add ones: 4+7=11, write 1 carry 1. Tens: 1+2+1=4. Answer: 41"}
+{"prompt":"Problem: 36 + 18 = ?\nSolution:","completion":" Add ones: 6+8=14, write 4 carry 1. Tens: 3+1+1=5. Answer: 54"}
+{"prompt":"Problem: 45 + 29 = ?\nSolution:","completion":" Add ones: 5+9=14, write 4 carry 1. Tens: 4+2+1=7. Answer: 74"}
+{"prompt":"Problem: 63 + 28 = ?\nSolution:","completion":" Add ones: 3+8=11, write 1 carry 1. Tens: 6+2+1=9. Answer: 91"}
+{"prompt":"Problem: 58 + 37 = ?\nSolution:","completion":" Add ones: 8+7=15, write 5 carry 1. Tens: 5+3+1=9. Answer: 95"}
