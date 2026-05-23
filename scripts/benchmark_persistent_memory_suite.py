@@ -33,7 +33,8 @@ import torch.nn.functional as F
 from ntkmirror.compose import compose_states, composition_report, save_report, dense_gate_vector, pair_report
 from ntkmirror.controller import ForwardFineTuner, SignedLogMaskState
 from ntkmirror.data import Example, load_jsonl_examples, save_jsonl_examples, make_batch
-from ntkmirror.memory import ControllerMemoryStore
+from ntkmirror.memory import ControllerMemoryStore, MemoryHit
+from ntkmirror.retrieval import MemoryRetriever, build_memory_retriever
 
 
 @dataclasses.dataclass
@@ -398,6 +399,32 @@ def cmd_fit_one(args) -> None:
     print(json.dumps(result, indent=2), flush=True)
 
 
+
+def _memory_text_for_task(task: dict[str, Any], *, mode: str, train_snippets: int) -> str:
+    """Build retrieval text for one controller-memory item.
+
+    Descriptor-only retrieval is intentionally brittle: GSM8K and BoolQ queries
+    often do not contain words like "grade-school" or "yes-no".  The default
+    includes a small prompt-only sample from the controller's own training set,
+    which is the realistic memory-index analogue of storing document snippets
+    beside an activation controller.  Completions are excluded by default so the
+    retriever does not index answer text.
+    """
+    desc = str(task.get("descriptor", ""))
+    mode = str(mode or "descriptor_prompts").strip().lower()
+    if mode in {"descriptor", "desc"}:
+        return desc
+    examples = load_jsonl_examples(task["train_path"])
+    snippets = []
+    for ex in examples[: max(0, int(train_snippets))]:
+        if mode in {"descriptor_prompts", "prompts", "descriptor_prompt_examples"}:
+            snippets.append(ex.prompt[:1000])
+        elif mode in {"descriptor_full", "full", "descriptor_train_examples"}:
+            snippets.append((ex.prompt + "\n" + ex.completion)[:1200])
+        else:
+            raise ValueError("memory_text_mode must be descriptor, descriptor_prompts, or descriptor_full")
+    return desc + ("\n\nRepresentative prompts:\n" + "\n---\n".join(snippets) if snippets else "")
+
 def cmd_register(args) -> None:
     out = Path(args.out)
     manifest = _read_json(out / "manifest.json")
@@ -407,12 +434,22 @@ def cmd_register(args) -> None:
         ctrl_path = out / "controllers" / f"{task_id}.pt"
         if not ctrl_path.exists():
             raise FileNotFoundError(ctrl_path)
+        retrieval_text = _memory_text_for_task(
+            task,
+            mode=args.memory_text_mode,
+            train_snippets=args.memory_train_snippets,
+        )
         store.add_controller(
             memory_id=task_id,
             controller_path=ctrl_path,
-            text=task["descriptor"],
+            text=retrieval_text,
             tags=[task_id, "benchmark"],
-            metadata={"task_id": task_id, "descriptor": task["descriptor"]},
+            metadata={
+                "task_id": task_id,
+                "descriptor": task["descriptor"],
+                "retrieval_text_mode": args.memory_text_mode,
+                "retrieval_text": retrieval_text[:4000],
+            },
             overwrite=True,
         )
     print(json.dumps({"store": str(out / "memory_store"), "items": [t["task_id"] for t in manifest["tasks"]]}, indent=2), flush=True)
@@ -470,12 +507,12 @@ def _causal_sum_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor
     return F.cross_entropy(shift_logits[mask], shift_labels[mask], reduction="sum")
 
 
-def _retrieval_recall(store: ControllerMemoryStore, task_id: str, rows: Sequence[EvalRow], *, top_k: int) -> dict[str, float]:
+def _retrieval_recall(retriever: MemoryRetriever, task_id: str, rows: Sequence[EvalRow], *, top_k: int) -> dict[str, float]:
     top1 = 0
     topk = 0
     n = 0
     for r in rows:
-        hits = store.search(r.query, top_k=top_k)
+        hits = retriever.search(r.query, top_k=top_k)
         ids = [h.item.id for h in hits]
         if not ids:
             continue
@@ -560,14 +597,14 @@ def _controller_diagnostics(out: Path, states: dict[str, SignedLogMaskState]) ->
     return rows
 
 
-def _retrieval_sweep(out: Path, store: ControllerMemoryStore, task_rows: dict[str, list[EvalRow]], *, max_k: int = 5) -> list[dict[str, Any]]:
+def _retrieval_sweep(out: Path, retriever: MemoryRetriever, task_rows: dict[str, list[EvalRow]], *, max_k: int = 5) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for tid, rows_eval in task_rows.items():
         for k in range(1, max_k + 1):
             top1 = topk = n = 0
             scores_gold = []
             for r in rows_eval:
-                hits = store.search(r.query, top_k=k)
+                hits = retriever.search(r.query, top_k=k)
                 ids = [h.item.id for h in hits]
                 if not ids:
                     continue
@@ -588,6 +625,109 @@ def _retrieval_sweep(out: Path, store: ControllerMemoryStore, task_rows: dict[st
     _write_csv(out / "retrieval_sweep.csv", rows)
     return rows
 
+
+
+def _compose_for_query(
+    store: ControllerMemoryStore,
+    retriever: MemoryRetriever,
+    query: str,
+    *,
+    top_k: int,
+    weighting: str,
+    temperature: float,
+    max_log_gate: float | None,
+) -> tuple[SignedLogMaskState, list[MemoryHit]]:
+    hits = retriever.search(query, top_k=top_k)
+    hits = store.weight_hits(hits, weighting=weighting, temperature=temperature)
+    if not hits:
+        raise ValueError("memory retrieval returned no controllers")
+    states = [SignedLogMaskState.load(store.controller_path(h.item), map_location="cpu") for h in hits]
+    state = compose_states(states, weights=[h.weight for h in hits], max_log_gate=max_log_gate)
+    return state, hits
+
+
+def _retrieval_signature(hits: Sequence[MemoryHit]) -> tuple[tuple[str, float], ...]:
+    return tuple((h.item.id, round(float(h.weight), 6)) for h in hits)
+
+
+def _evaluate_retrieved_per_example(
+    tuner: ForwardFineTuner,
+    store: ControllerMemoryStore,
+    retriever: MemoryRetriever,
+    rows: Sequence[EvalRow],
+    *,
+    top_k: int,
+    weighting: str,
+    temperature: float,
+    max_log_gate: float,
+    batch_size: int,
+    max_length: int,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    """Evaluate with memory retrieved from each individual query.
+
+    Rows that retrieve the same controller signature are grouped so top-1
+    retrieval remains cheap.  This is the realistic persistent-memory path; the
+    descriptor-query path is kept only as a diagnostic.
+    """
+    groups: dict[tuple[tuple[str, float], ...], list[tuple[int, EvalRow, list[MemoryHit]]]] = {}
+    per_rows: list[dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        raw = retriever.search(row.query, top_k=top_k)
+        hits = store.weight_hits(raw, weighting=weighting, temperature=temperature)
+        sig = _retrieval_signature(hits)
+        groups.setdefault(sig, []).append((i, row, hits))
+
+    total_loss = 0.0
+    total_tokens = 0.0
+    weighted_token_acc = 0.0
+    for sig, items in groups.items():
+        hits = items[0][2]
+        examples = [Example(r.prompt, r.completion) for _, r, _ in items]
+        state = None
+        if hits:
+            states = [SignedLogMaskState.load(store.controller_path(h.item), map_location="cpu") for h in hits]
+            state = compose_states(states, weights=[h.weight for h in hits], max_log_gate=max_log_gate)
+        metrics = _evaluate_nll_with_state(tuner, examples, state, batch_size=batch_size, max_length=max_length)
+        tokens = float(metrics.get("tokens", 0.0))
+        total_loss += float(metrics.get("nll", 0.0)) * tokens
+        total_tokens += tokens
+        weighted_token_acc += float(metrics.get("token_acc", 0.0)) * tokens
+        ids = [h.item.id for h in hits]
+        weights = [h.weight for h in hits]
+        for idx, row, _ in items:
+            per_rows.append({
+                "row": idx,
+                "retrieved_ids": ";".join(ids),
+                "retrieved_weights": ";".join(f"{w:.4f}" for w in weights),
+            })
+    return {
+        "nll": total_loss / max(1.0, total_tokens),
+        "token_acc": weighted_token_acc / max(1.0, total_tokens),
+        "tokens": total_tokens,
+    }, sorted(per_rows, key=lambda r: int(r["row"]))
+
+
+def _retrieval_method_comparison(out: Path, store: ControllerMemoryStore, args, task_rows: dict[str, list[EvalRow]]) -> list[dict[str, Any]]:
+    methods = [x.strip() for x in str(args.retrieval_compare_methods).split(",") if x.strip()]
+    rows: list[dict[str, Any]] = []
+    for method in methods:
+        try:
+            retr = build_memory_retriever(
+                store,
+                method=method,
+                embedding_model=args.embedding_model,
+                embedding_device=args.embedding_device,
+                hybrid_alpha=args.hybrid_alpha,
+                batch_size=args.embedding_batch_size,
+            )
+        except Exception as e:
+            rows.append({"retriever": method, "error": str(e)})
+            continue
+        for tid, eval_rows in task_rows.items():
+            rec = _retrieval_recall(retr, tid, eval_rows, top_k=args.top_k)
+            rows.append({"retriever": method, "task_id": tid, **rec})
+    _write_csv(out / "retrieval_method_comparison.csv", rows)
+    return rows
 
 def _selectivity_summary(out: Path, cross_rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     by_task: dict[str, list[dict[str, Any]]] = {}
@@ -619,10 +759,60 @@ def _selectivity_summary(out: Path, cross_rows: Sequence[dict[str, Any]]) -> lis
     _write_csv(out / "selectivity_summary.csv", rows)
     return rows
 
+def _choice_accuracy_retrieved_per_example(
+    tuner: ForwardFineTuner,
+    store: ControllerMemoryStore,
+    retriever: MemoryRetriever,
+    rows: Sequence[EvalRow],
+    *,
+    top_k: int,
+    weighting: str,
+    temperature: float,
+    max_log_gate: float,
+    max_length: int,
+) -> dict[str, float]:
+    rows = [r for r in rows if r.choices is not None and r.gold_index is not None]
+    if not rows:
+        return {"choice_acc": math.nan, "choice_n": 0.0}
+    correct = 0
+    for r in rows:
+        raw = retriever.search(r.query, top_k=top_k)
+        hits = store.weight_hits(raw, weighting=weighting, temperature=temperature)
+        state = None
+        if hits:
+            states = [SignedLogMaskState.load(store.controller_path(h.item), map_location="cpu") for h in hits]
+            state = compose_states(states, weights=[h.weight for h in hits], max_log_gate=max_log_gate)
+        _attach_state(tuner, state)
+        if tuner.controller is not None:
+            tuner.controller.attach()
+        try:
+            losses = []
+            for choice in r.choices or []:
+                batch = make_batch(tuner.tokenizer, [Example(r.prompt, choice)], device=next(tuner.model.parameters()).device, max_length=max_length)
+                with torch.no_grad():
+                    out = tuner.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"), use_cache=False)
+                    loss = _causal_sum_loss(out.logits, batch["labels"])
+                losses.append(float(loss))
+            pred = int(min(range(len(losses)), key=lambda i: losses[i]))
+            correct += int(pred == int(r.gold_index))
+        finally:
+            if tuner.controller is not None:
+                tuner.controller.remove()
+    return {"choice_acc": correct / max(1, len(rows)), "choice_n": float(len(rows))}
+
+
 def cmd_eval(args) -> None:
     out = Path(args.out)
     manifest = _read_json(out / "manifest.json")
     store = ControllerMemoryStore(out / "memory_store")
+    retriever = build_memory_retriever(
+        store,
+        method=args.retrieval_method,
+        embedding_model=args.embedding_model,
+        embedding_device=args.embedding_device,
+        hybrid_alpha=args.hybrid_alpha,
+        batch_size=args.embedding_batch_size,
+    )
     model, tok = _load_model(args.model, args.device, args.dtype)
     tuner = ForwardFineTuner(model, tok, gates=args.gates, layers=args.layers, max_log_gate=args.max_log_gate)
 
@@ -641,50 +831,76 @@ def cmd_eval(args) -> None:
     _leakage_audit(out, manifest)
     _controller_diagnostics(out, states)
 
-    # Compose all memories uniformly; useful for testing global interference.
     all_state = compose_states(list(states.values()), weights=[1.0] * len(states), max_log_gate=args.max_log_gate)
     all_path = out / "memory_store" / "composed_all.pt"
     all_state.save(all_path)
     save_report(out / "composition_report.json", composition_report([str(out / "controllers" / f"{k}.pt") for k in states], list(states.values())))
 
-    _retrieval_sweep(out, store, task_rows, max_k=min(5, max(1, len(states))))
+    _retrieval_sweep(out, retriever, task_rows, max_k=min(5, max(1, len(states))))
+    _retrieval_method_comparison(out, store, args, task_rows)
 
     summary_rows: list[dict[str, Any]] = []
     cross_rows: list[dict[str, Any]] = []
     retrieval_rows: list[dict[str, Any]] = []
+    per_example_rows_all: list[dict[str, Any]] = []
 
     for task_id, rows in task_rows.items():
         examples = task_examples[task_id]
         base = _evaluate_nll_with_state(tuner, examples, None, batch_size=args.eval_batch_size, max_length=args.max_length)
         base_choice = _choice_accuracy(tuner, rows, None, max_length=args.max_length) if args.choice_acc else {}
-        retrieval = _retrieval_recall(store, task_id, rows, top_k=args.top_k)
-        retrieval_rows.append({"task_id": task_id, **retrieval})
+        retrieval = _retrieval_recall(retriever, task_id, rows, top_k=args.top_k)
+        retrieval_rows.append({"task_id": task_id, "retriever": args.retrieval_method, **retrieval})
 
         gold = _evaluate_nll_with_state(tuner, examples, states[task_id], batch_size=args.eval_batch_size, max_length=args.max_length)
         gold_choice = _choice_accuracy(tuner, rows, states[task_id], max_length=args.max_length) if args.choice_acc else {}
-        task_query_state, hits = store.compose_for_query(task_desc[task_id], top_k=args.top_k, weighting=args.weighting, temperature=args.temperature, max_log_gate=args.max_log_gate)
-        retrieved = _evaluate_nll_with_state(tuner, examples, task_query_state, batch_size=args.eval_batch_size, max_length=args.max_length)
-        retrieved_choice = _choice_accuracy(tuner, rows, task_query_state, max_length=args.max_length) if args.choice_acc else {}
+
+        # Diagnostic: retrieval from task descriptor. This is not the real per-query path.
+        desc_state, desc_hits = _compose_for_query(
+            store, retriever, task_desc[task_id],
+            top_k=args.top_k, weighting=args.weighting, temperature=args.temperature, max_log_gate=args.max_log_gate,
+        )
+        retrieved_desc = _evaluate_nll_with_state(tuner, examples, desc_state, batch_size=args.eval_batch_size, max_length=args.max_length)
+        retrieved_desc_choice = _choice_accuracy(tuner, rows, desc_state, max_length=args.max_length) if args.choice_acc else {}
+
+        # Realistic persistent-memory path: retrieve memory from each individual query/prompt.
+        retrieved_query, per_rows = _evaluate_retrieved_per_example(
+            tuner, store, retriever, rows,
+            top_k=args.top_k, weighting=args.weighting, temperature=args.temperature,
+            max_log_gate=args.max_log_gate, batch_size=args.eval_batch_size, max_length=args.max_length,
+        )
+        retrieved_query_choice = _choice_accuracy_retrieved_per_example(
+            tuner, store, retriever, rows,
+            top_k=args.top_k, weighting=args.weighting, temperature=args.temperature,
+            max_log_gate=args.max_log_gate, max_length=args.max_length,
+        ) if args.choice_acc else {}
+        for rr in per_rows:
+            rr.update({"task_id": task_id, "gold_retrieved": int(task_id in str(rr.get("retrieved_ids", "")).split(";"))})
+        per_example_rows_all.extend(per_rows)
+
         composed = _evaluate_nll_with_state(tuner, examples, all_state, batch_size=args.eval_batch_size, max_length=args.max_length)
         composed_choice = _choice_accuracy(tuner, rows, all_state, max_length=args.max_length) if args.choice_acc else {}
 
-        for condition, metrics, cmetrics in [
-            ("base", base, base_choice),
-            ("gold_memory", gold, gold_choice),
-            ("retrieved_task_memory", retrieved, retrieved_choice),
-            ("composed_all_memories", composed, composed_choice),
-        ]:
+        condition_rows = [
+            ("base", base, base_choice, "", ""),
+            ("gold_memory", gold, gold_choice, "", ""),
+            ("retrieved_descriptor_memory", retrieved_desc, retrieved_desc_choice, ";".join(h.item.id for h in desc_hits), ";".join(f"{h.weight:.4f}" for h in desc_hits)),
+            ("retrieved_query_memory", retrieved_query, retrieved_query_choice, "per-example", "per-example"),
+            ("composed_all_memories", composed, composed_choice, "", ""),
+        ]
+        for condition, metrics, cmetrics, hit_ids, hit_weights in condition_rows:
             summary_rows.append({
                 "task_id": task_id,
                 "condition": condition,
+                "retriever": args.retrieval_method,
+                "retrieval_text_mode": args.memory_text_mode,
                 "nll": metrics.get("nll"),
                 "token_acc": metrics.get("token_acc"),
                 "tokens": metrics.get("tokens"),
                 "choice_acc": cmetrics.get("choice_acc", math.nan),
                 "choice_n": cmetrics.get("choice_n", 0.0),
                 "nll_delta_vs_base": metrics.get("nll") - base.get("nll"),
-                "retrieved_ids": ";".join(h.item.id for h in hits) if condition == "retrieved_task_memory" else "",
-                "retrieved_weights": ";".join(f"{h.weight:.4f}" for h in hits) if condition == "retrieved_task_memory" else "",
+                "retrieved_ids": hit_ids,
+                "retrieved_weights": hit_weights,
                 **retrieval,
             })
 
@@ -699,22 +915,18 @@ def cmd_eval(args) -> None:
                 "is_gold": int(mem_id == task_id),
             })
 
-        if args.per_example_retrieval_eval:
-            per_rows = []
-            for i, r in enumerate(rows):
-                try:
-                    st, hits = store.compose_for_query(r.query, top_k=args.top_k, weighting=args.weighting, temperature=args.temperature, max_log_gate=args.max_log_gate)
-                    m = _evaluate_nll_with_state(tuner, [Example(r.prompt, r.completion)], st, batch_size=1, max_length=args.max_length)
-                    per_rows.append({"task_id": task_id, "row": i, "nll": m["nll"], "retrieved_ids": ";".join(h.item.id for h in hits), "gold_retrieved": int(task_id in [h.item.id for h in hits])})
-                except Exception as e:
-                    per_rows.append({"task_id": task_id, "row": i, "error": str(e)})
-            _write_csv(out / "per_example_retrieved_memory.csv", per_rows)
-
     _write_csv(out / "summary.csv", summary_rows)
     _write_csv(out / "cross_task_nll.csv", cross_rows)
     _write_csv(out / "retrieval_recall.csv", retrieval_rows)
+    _write_csv(out / "per_example_retrieved_memory.csv", per_example_rows_all)
     _selectivity_summary(out, cross_rows)
-    print(json.dumps({"summary": str(out / "summary.csv"), "cross_task_nll": str(out / "cross_task_nll.csv"), "retrieval_recall": str(out / "retrieval_recall.csv")}, indent=2), flush=True)
+    print(json.dumps({
+        "summary": str(out / "summary.csv"),
+        "cross_task_nll": str(out / "cross_task_nll.csv"),
+        "retrieval_recall": str(out / "retrieval_recall.csv"),
+        "retrieval_method_comparison": str(out / "retrieval_method_comparison.csv"),
+        "per_example_retrieved_memory": str(out / "per_example_retrieved_memory.csv"),
+    }, indent=2), flush=True)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -753,6 +965,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
     reg = sub.add_parser("register")
     reg.add_argument("--out", required=True)
+    reg.add_argument("--memory-text-mode", default=os.environ.get("MEMORY_TEXT_MODE", "descriptor_prompts"), choices=["descriptor", "descriptor_prompts", "descriptor_full"])
+    reg.add_argument("--memory-train-snippets", type=int, default=int(os.environ.get("MEMORY_TRAIN_SNIPPETS", "32")))
     reg.set_defaults(func=cmd_register)
 
     ev = sub.add_parser("eval")
@@ -763,7 +977,13 @@ def build_argparser() -> argparse.ArgumentParser:
     ev.add_argument("--weighting", default=os.environ.get("WEIGHTING", "softmax"), choices=["softmax", "score", "uniform"])
     ev.add_argument("--temperature", type=float, default=float(os.environ.get("TEMPERATURE", "0.25")))
     ev.add_argument("--choice-acc", action="store_true", default=os.environ.get("CHOICE_ACC", "1") != "0")
-    ev.add_argument("--per-example-retrieval-eval", action="store_true", default=os.environ.get("PER_EXAMPLE_RETRIEVAL_EVAL", "0") == "1")
+    ev.add_argument("--retrieval-method", default=os.environ.get("RETRIEVAL_METHOD", "hybrid"), choices=["lexical", "embedding", "hybrid"])
+    ev.add_argument("--retrieval-compare-methods", default=os.environ.get("RETRIEVAL_COMPARE_METHODS", "lexical,embedding,hybrid"))
+    ev.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"))
+    ev.add_argument("--embedding-device", default=os.environ.get("EMBEDDING_DEVICE", "cpu"))
+    ev.add_argument("--embedding-batch-size", type=int, default=int(os.environ.get("EMBEDDING_BATCH_SIZE", "64")))
+    ev.add_argument("--hybrid-alpha", type=float, default=float(os.environ.get("HYBRID_ALPHA", "0.65")))
+    ev.add_argument("--memory-text-mode", default=os.environ.get("MEMORY_TEXT_MODE", "descriptor_prompts"))
     ev.set_defaults(func=cmd_eval)
     return p
 

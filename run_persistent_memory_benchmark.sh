@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Useful overrides:
 #   MODEL=Qwen/Qwen2.5-7B-Instruct TASKS=gsm8k,mbpp,hellaswag,arc_easy,boolq \
-#   TRAIN_PER_TASK=512 EVAL_PER_TASK=200 GATES=50000 GPU_LIST="0 1 2 3 4" \
+#   TRAIN_PER_TASK=512 EVAL_PER_TASK=200 GATES=50000 RETRIEVAL_METHOD=hybrid MEMORY_TEXT_MODE=descriptor_prompts GPU_LIST="0 1 2 3 4" \
 #   bash run_persistent_memory_benchmark.sh
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -32,6 +32,14 @@ SCORE_BATCHES=${SCORE_BATCHES:-16}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-8}
 TOP_K=${TOP_K:-1}
+RETRIEVAL_METHOD=${RETRIEVAL_METHOD:-hybrid}
+RETRIEVAL_COMPARE_METHODS=${RETRIEVAL_COMPARE_METHODS:-lexical,embedding,hybrid}
+EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-64}
+HYBRID_ALPHA=${HYBRID_ALPHA:-0.65}
+MEMORY_TEXT_MODE=${MEMORY_TEXT_MODE:-descriptor_prompts}
+MEMORY_TRAIN_SNIPPETS=${MEMORY_TRAIN_SNIPPETS:-32}
 GPU_LIST=${GPU_LIST:-$(python - <<'PY'
 import torch
 n=torch.cuda.device_count()
@@ -76,16 +84,18 @@ for pid in "${pids[@]}"; do
   wait "$pid"
 done
 
-python scripts/benchmark_persistent_memory_suite.py register --out "$OUT"
+python scripts/benchmark_persistent_memory_suite.py register --out "$OUT" --memory-text-mode "$MEMORY_TEXT_MODE" --memory-train-snippets "$MEMORY_TRAIN_SNIPPETS"
 
 eval_gpu=""
 if [[ ${#GPU_ARRAY[@]} -gt 0 ]]; then eval_gpu="${GPU_ARRAY[0]}"; fi
 if [[ -n "$eval_gpu" ]]; then
   CUDA_VISIBLE_DEVICES="$eval_gpu" MODEL="$MODEL" DTYPE="$DTYPE" GATES="$GATES" MAX_LOG_GATE="$MAX_LOG_GATE" \
-  EVAL_BATCH_SIZE="$EVAL_BATCH_SIZE" TOP_K="$TOP_K" \
+  EVAL_BATCH_SIZE="$EVAL_BATCH_SIZE" TOP_K="$TOP_K" RETRIEVAL_METHOD="$RETRIEVAL_METHOD" RETRIEVAL_COMPARE_METHODS="$RETRIEVAL_COMPARE_METHODS" \
+  EMBEDDING_MODEL="$EMBEDDING_MODEL" EMBEDDING_DEVICE="$EMBEDDING_DEVICE" EMBEDDING_BATCH_SIZE="$EMBEDDING_BATCH_SIZE" HYBRID_ALPHA="$HYBRID_ALPHA" MEMORY_TEXT_MODE="$MEMORY_TEXT_MODE" \
   python scripts/benchmark_persistent_memory_suite.py eval --out "$OUT"
 else
-  MODEL="$MODEL" DTYPE="$DTYPE" GATES="$GATES" DEVICE=cpu EVAL_BATCH_SIZE="$EVAL_BATCH_SIZE" TOP_K="$TOP_K" \
+  MODEL="$MODEL" DTYPE="$DTYPE" GATES="$GATES" DEVICE=cpu EVAL_BATCH_SIZE="$EVAL_BATCH_SIZE" TOP_K="$TOP_K" RETRIEVAL_METHOD="$RETRIEVAL_METHOD" RETRIEVAL_COMPARE_METHODS="$RETRIEVAL_COMPARE_METHODS" \
+  EMBEDDING_MODEL="$EMBEDDING_MODEL" EMBEDDING_DEVICE="$EMBEDDING_DEVICE" EMBEDDING_BATCH_SIZE="$EMBEDDING_BATCH_SIZE" HYBRID_ALPHA="$HYBRID_ALPHA" MEMORY_TEXT_MODE="$MEMORY_TEXT_MODE" \
   python scripts/benchmark_persistent_memory_suite.py eval --out "$OUT"
 fi
 
@@ -99,7 +109,7 @@ print('\n=== retrieval_recall.csv ===')
 print(pd.read_csv(out/'retrieval_recall.csv').to_string(index=False))
 print('\n=== cross_task_nll.csv ===')
 print(pd.read_csv(out/'cross_task_nll.csv').to_string(index=False))
-for extra in ['selectivity_summary.csv','retrieval_sweep.csv','controller_diagnostics.csv','controller_pairwise_geometry.csv','leakage_audit.csv']:
+for extra in ['retrieval_method_comparison.csv','selectivity_summary.csv','retrieval_sweep.csv','controller_diagnostics.csv','controller_pairwise_geometry.csv','leakage_audit.csv','per_example_retrieved_memory.csv']:
     path=out/extra
     if path.exists():
         print(f'\n=== {extra} ===')

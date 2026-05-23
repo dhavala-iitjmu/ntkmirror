@@ -4,3 +4,4 @@ accelerate>=0.30
 safetensors>=0.4
 datasets>=2.19
 pandas>=2.0
+sentence-transformers>=3.0
