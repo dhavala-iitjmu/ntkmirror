@@ -18,7 +18,7 @@ Hugging Face model during evaluation or generation.
 ## Install
 
 ```bash
-git clone https://github.com/yourname/ntkmirror.git
+git clone https://github.com/leochlon/ntkmirror.git
 cd ntkmirror
 pip install -e .
 ```
@@ -224,7 +224,7 @@ For system claims, report adaptation time and peak memory. See
   title        = {{NTK-Mirror: LoRA-free forward-pass fine-tuning via signed log-mask controllers}},
   year         = {2026},
   organization = {Hassana Labs},
-  url          = {https://github.com/hassana-labs/ntkmirror}
+  url          = {https://github.com/leochlon/ntkmirror}
 }
 ```
 
