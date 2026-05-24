@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# ntkmirror run outputs
+runs/
+logs/
+*.pt

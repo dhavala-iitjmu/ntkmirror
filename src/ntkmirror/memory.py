@@ -10,8 +10,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-import torch
-
 from .compose import compose_states
 from .controller import SignedLogMaskState
 

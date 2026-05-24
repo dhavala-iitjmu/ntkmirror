@@ -5,7 +5,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 from torch import nn
@@ -449,8 +449,8 @@ class ForwardFineTuner:
         if self.controller is None:
             return []
         return [
-            {"layer": int(l), "channel": int(c)}
-            for l, c in zip(
+            {"layer": int(layer_idx), "channel": int(channel_idx)}
+            for layer_idx, channel_idx in zip(
                 self.controller.layer_indices.detach().cpu().tolist(),
                 self.controller.channel_indices.detach().cpu().tolist(),
                 strict=True,
