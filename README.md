@@ -210,10 +210,6 @@ ntkmirror isr-auc \
   --out runs/isr_custom.json
 ```
 
-For the KV path, run with `--backend kv-delta-bayes-ntk --fit-controller` and
-place the legacy controller package on `PYTHONPATH`. The CLI refuses to ignore
-unsupported reproducibility/security flags on that backend. Raw claims/evidence
-are omitted from outputs unless `--include-raw` is set.
 
 ## Persistent controller memory
 
