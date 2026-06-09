@@ -36,6 +36,10 @@ ntkmirror fit --model Qwen/Qwen2.5-0.5B-Instruct --train train.jsonl --out contr
 ntkmirror eval --model Qwen/Qwen2.5-0.5B-Instruct --controller controller.pt --eval eval.jsonl
 ```
 
+Examples are raw prompt/completion strings. Chat or instruct templates are not
+applied automatically; apply them before writing JSONL if the base checkpoint
+expects template-formatted conversations.
+
 ## Failure modes to check before believing a result
 
 1. **Base example selection.** If evaluation contains problems the base model
@@ -55,8 +59,9 @@ ntkmirror eval --model Qwen/Qwen2.5-0.5B-Instruct --controller controller.pt --e
 5. **Layer hooks.** This package gates decoder-layer outputs. Architectures
    without a standard decoder stack may need a layer-path extension.
 
-6. **Seed manifests.** For benchmark claims, fix train/eval splits and compare
-   every arm on the same examples.
+6. **Seed manifests and identity.** For benchmark claims, fix train/eval splits,
+   save dataset hashes, pin model/tokenizer revisions, and compare every arm on
+   the same examples.
 
 7. **Oracle diagnostics.** Fitting a controller to an SGD displacement is useful
    for theorem diagnostics, but it is not a deployable fine-tuning method. The
@@ -79,7 +84,8 @@ d_C^theta = -eta J_{theta,C} J_{theta,S}^T g_S .
 ```
 
 The controller is dual only when this target field lies in the output range of
-`B_C(s)` on the chosen projected-logit coordinates. The relevant residual is
+`B_C(s)` on the chosen projected-logit coordinates and the applied signed-log
+update remains inside the controller box constraint. The relevant residual is
 therefore
 
 ```text

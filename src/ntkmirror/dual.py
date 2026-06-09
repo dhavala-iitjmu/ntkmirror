@@ -91,16 +91,25 @@ def build_logit_projection(
         return LogitProjectionSpec(mode, mask.detach().cpu(), None, 0, bool(center), vocab_size, n_positions)
     if mode == "target":
         indices = selected_labels.view(-1, 1)
+        kept_top_k = 0
         dim = int(indices.numel())
     else:
-        k = max(1, min(int(top_k), vocab_size))
+        kept_top_k = max(0, min(int(top_k), max(0, vocab_size - 1)))
         base_selected = shift_logits.detach()[mask].float().cpu()
-        top = torch.topk(base_selected, k=k, dim=-1).indices.long()
-        indices = torch.cat([selected_labels.view(-1, 1), top], dim=1)
+        if kept_top_k > 0:
+            # Keep the teacher token once, then the top-k non-teacher baseline
+            # tokens. Duplicating the teacher coordinate silently overweighted
+            # the gold token in v1 diagnostics.
+            masked = base_selected.clone()
+            masked.scatter_(1, selected_labels.view(-1, 1), float("-inf"))
+            top = torch.topk(masked, k=kept_top_k, dim=-1).indices.long()
+            indices = torch.cat([selected_labels.view(-1, 1), top], dim=1)
+        else:
+            indices = selected_labels.view(-1, 1)
         dim = int(indices.numel())
     if max_dim is not None and dim > int(max_dim):
         raise ValueError(f"projection would create {dim} coordinates > max_dim={max_dim}")
-    return LogitProjectionSpec(mode, mask.detach().cpu(), indices.detach().cpu(), int(top_k), bool(center), vocab_size, n_positions)
+    return LogitProjectionSpec(mode, mask.detach().cpu(), indices.detach().cpu(), int(kept_top_k), bool(center), vocab_size, n_positions)
 
 
 def apply_logit_projection(logits: torch.Tensor, labels: torch.Tensor, spec: LogitProjectionSpec) -> torch.Tensor:
@@ -384,12 +393,18 @@ class DualProjectionDiagnostics:
     range_cosine: float
     realized_residual: float
     realized_cosine: float
+    clipped_realized_residual: float
+    clipped_realized_cosine: float
     target_norm: float
     projected_norm: float
     realized_norm: float
+    clipped_realized_norm: float
     update_norm: float
     update_metric_norm: float
     max_abs_update: float
+    box_active_fraction: float
+    box_clip_fraction: float
+    box_clip_update_residual: float
     ridge: float
     fd_eps: float
     jvp_mode: str
@@ -408,6 +423,7 @@ class GateProjectionSolution:
     projected_field: torch.Tensor
     realized_field: torch.Tensor
     diagnostics: DualProjectionDiagnostics
+    clipped_realized_field: torch.Tensor | None = None
 
 
 def _metric_inverse_mul(v: torch.Tensor, metric_diag: torch.Tensor | None) -> torch.Tensor:
@@ -445,13 +461,17 @@ def gate_activation_metric_diag(
     *,
     eps: float = 1e-6,
     include_current_scale: bool = True,
+    record_current_state: bool = True,
 ) -> torch.Tensor:
     """Approximate diagonal activation-control metric for selected gates.
 
     For a log-scale gate, the local activation displacement is
-    ``delta h[..., c] = exp(s_c) * h[..., c] * delta s_c``. This returns
-    ``E[h_c^2] * exp(2s_c)`` on the calibration batch. It is a diagonal
-    pullback metric in activation space, not a full virtual-weight metric.
+    ``delta h[..., c] = exp(s_c) * h[..., c] * delta s_c``. By default this
+    records activations with the current controller attached, so
+    upstream gates can affect downstream-layer metrics and the selected site is
+    already measured at the scaled value. Set ``record_current_state=False`` to
+    recover the old base-activation approximation, where ``include_current_scale``
+    applies the local ``exp(2s_c)`` factor after recording.
     """
     if controller is None:
         raise ValueError("controller is required for activation metric")
@@ -489,7 +509,10 @@ def gate_activation_metric_diag(
         return hook
 
     was_attached = bool(getattr(controller, "is_attached", False))
-    if was_attached:
+    if record_current_state:
+        if not was_attached:
+            controller.attach()
+    elif was_attached:
         controller.remove()
     try:
         for i, layer in enumerate(controller.layers):
@@ -504,7 +527,10 @@ def gate_activation_metric_diag(
     finally:
         for h in handles:
             h.remove()
-        if was_attached:
+        if record_current_state:
+            if not was_attached:
+                controller.remove()
+        elif was_attached:
             controller.attach()
 
     out = torch.empty(n, dtype=torch.float32, device=device)
@@ -524,7 +550,7 @@ def gate_activation_metric_diag(
             else:
                 out[i] = float(ss[channel_id].item())
     out = out.clamp_min(float(eps))
-    if include_current_scale:
+    if include_current_scale and not record_current_state:
         s_now = controller.s.detach().float().to(device).reshape_as(out)
         out = out * torch.exp(2.0 * s_now).clamp_min(0.0)
     return out.clamp_min(float(eps))
@@ -620,25 +646,54 @@ def solve_gate_projection_matrix_free(
     projected = b_v(update).detach().float().reshape(-1)
     with torch.no_grad():
         base = field_at(s0, grad=False).detach().float().reshape(-1)
-        realized = (field_at(s0 + update, grad=False).detach().float().reshape(-1) - base)
+        unconstrained_s = s0 + update
+        max_log_gate = float(getattr(controller, "max_log_gate", float("inf")))
+        if math.isfinite(max_log_gate) and max_log_gate > 0.0:
+            clipped_s = torch.clamp(unconstrained_s, -max_log_gate, max_log_gate)
+        else:
+            clipped_s = unconstrained_s
+        clip_delta = unconstrained_s - clipped_s
+        realized = (field_at(unconstrained_s, grad=False).detach().float().reshape(-1) - base)
+        clipped_realized = (field_at(clipped_s, grad=False).detach().float().reshape(-1) - base)
     range_residual = _relerr(target, projected)
     realized_residual = _relerr(target, realized)
+    clipped_realized_residual = _relerr(target, clipped_realized)
+    update_norm_val = _norm(update)
+    clip_norm = _norm(clip_delta)
+    if clip_delta.numel():
+        box_clip_fraction = float((clip_delta.detach().abs() > 1e-7).float().mean().item())
+        if math.isfinite(max_log_gate) and max_log_gate > 0.0:
+            box_active_fraction = float((clipped_s.detach().abs() >= max_log_gate - 1e-7).float().mean().item())
+        else:
+            box_active_fraction = 0.0
+    else:
+        box_clip_fraction = 0.0
+        box_active_fraction = 0.0
     diag = DualProjectionDiagnostics(
         projection=spec.to_dict(),
         target={"mode": "full_weight_sgd_finite_difference", "field_dim": int(target.numel())},
         cg=cg_info.to_dict(),
-        field_residual=realized_residual,
-        field_cosine=_cos(target, realized),
+        # field_* is the safety-facing realised field after applying the same
+        # box constraint as controller.set_signed_log_values_(). realized_* keeps
+        # the unconstrained diagnostic for NTK-range auditing.
+        field_residual=clipped_realized_residual,
+        field_cosine=_cos(target, clipped_realized),
         range_residual=range_residual,
         range_cosine=_cos(target, projected),
         realized_residual=realized_residual,
         realized_cosine=_cos(target, realized),
+        clipped_realized_residual=clipped_realized_residual,
+        clipped_realized_cosine=_cos(target, clipped_realized),
         target_norm=_norm(target),
         projected_norm=_norm(projected),
         realized_norm=_norm(realized),
-        update_norm=_norm(update),
+        clipped_realized_norm=_norm(clipped_realized),
+        update_norm=update_norm_val,
         update_metric_norm=_metric_norm(update, metric_diag),
         max_abs_update=float(update.detach().abs().max().item()) if update.numel() else 0.0,
+        box_active_fraction=box_active_fraction,
+        box_clip_fraction=box_clip_fraction,
+        box_clip_update_residual=clip_norm / max(update_norm_val, 1e-30),
         ridge=float(ridge),
         fd_eps=float(fd_eps),
         jvp_mode=jvp_mode,
@@ -652,6 +707,7 @@ def solve_gate_projection_matrix_free(
         projected_field=projected.detach().cpu(),
         realized_field=realized.detach().cpu(),
         diagnostics=diag,
+        clipped_realized_field=clipped_realized.detach().cpu(),
     )
 
 

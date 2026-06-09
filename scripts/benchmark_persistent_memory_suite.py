@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -324,9 +325,26 @@ def cmd_prepare(args) -> None:
     _write_json(out / "manifest.json", manifest)
 
 
-def _load_model(model_name: str, device: str, dtype: str):
+def _load_model(
+    model_name: str,
+    device: str,
+    dtype: str,
+    *,
+    trust_remote_code: bool = False,
+    revision: str | None = None,
+    tokenizer_revision: str | None = None,
+    local_files_only: bool = False,
+    cache_dir: str | None = None,
+):
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tok_revision = tokenizer_revision or revision
+    tok = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=bool(trust_remote_code),
+        revision=tok_revision,
+        local_files_only=bool(local_files_only),
+        cache_dir=cache_dir,
+    )
     if dtype == "auto":
         torch_dtype = "auto"
     elif dtype == "bf16":
@@ -337,7 +355,17 @@ def _load_model(model_name: str, device: str, dtype: str):
         torch_dtype = torch.float32
     else:
         raise ValueError("dtype must be auto/bf16/fp16/fp32")
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch_dtype,
+        trust_remote_code=bool(trust_remote_code),
+        revision=revision,
+        local_files_only=bool(local_files_only),
+        cache_dir=cache_dir,
+    )
+    if hasattr(model, "config"):
+        setattr(model.config, "_ntkmirror_requested_revision", revision)
+    setattr(tok, "_ntkmirror_requested_revision", tok_revision)
     model.to(torch.device(device))
     model.eval()
     if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token", None) is not None:
@@ -348,8 +376,27 @@ def _load_model(model_name: str, device: str, dtype: str):
 
 
 def _make_tuner(args) -> ForwardFineTuner:
-    model, tok = _load_model(args.model, args.device, args.dtype)
-    return ForwardFineTuner(model, tok, gates=args.gates, layers=args.layers, max_log_gate=args.max_log_gate)
+    model, tok = _load_model(
+        args.model,
+        args.device,
+        args.dtype,
+        trust_remote_code=getattr(args, "trust_remote_code", False),
+        revision=getattr(args, "revision", None),
+        tokenizer_revision=getattr(args, "tokenizer_revision", None),
+        local_files_only=getattr(args, "local_files_only", False),
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    return ForwardFineTuner(
+        model,
+        tok,
+        gates=args.gates,
+        layers=args.layers,
+        max_log_gate=args.max_log_gate,
+        model_name=args.model,
+        model_revision=getattr(args, "revision", None),
+        tokenizer_name=args.model,
+        tokenizer_revision=getattr(args, "tokenizer_revision", None) or getattr(args, "revision", None),
+    )
 
 
 def cmd_fit_one(args) -> None:
@@ -456,16 +503,20 @@ def cmd_register(args) -> None:
 
 
 def _attach_state(tuner: ForwardFineTuner, state: SignedLogMaskState | None):
+    if tuner.controller is not None:
+        tuner.controller.remove()
     if state is None:
         tuner.controller = None
     else:
         tmp = Path(os.environ.get("NTKMIRROR_TMP", "/tmp")) / f"ntkmirror_tmp_state_{os.getpid()}_{time.time_ns()}.pt"
         state.save(tmp)
-        tuner.load(tmp)
         try:
-            tmp.unlink()
-        except OSError:
-            pass
+            tuner.load(tmp)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _evaluate_nll_with_state(tuner: ForwardFineTuner, examples: Sequence[Example], state: SignedLogMaskState | None, *, batch_size: int, max_length: int) -> dict[str, float]:
@@ -476,35 +527,61 @@ def _evaluate_nll_with_state(tuner: ForwardFineTuner, examples: Sequence[Example
 def _choice_accuracy(tuner: ForwardFineTuner, rows: Sequence[EvalRow], state: SignedLogMaskState | None, *, max_length: int) -> dict[str, float]:
     rows = [r for r in rows if r.choices is not None and r.gold_index is not None]
     if not rows:
-        return {"choice_acc": math.nan, "choice_n": 0.0}
+        return {"choice_acc": math.nan, "choice_acc_len_norm": math.nan, "choice_acc_sum_loss": math.nan, "choice_n": 0.0}
     _attach_state(tuner, state)
     if tuner.controller is not None:
         tuner.controller.attach()
-    correct = 0
+    correct_norm = 0
+    correct_sum = 0
     try:
         for r in rows:
-            losses = []
-            for choice in r.choices or []:
-                batch = make_batch(tuner.tokenizer, [Example(r.prompt, choice)], device=next(tuner.model.parameters()).device, max_length=max_length)
-                with torch.no_grad():
-                    out = tuner.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"), use_cache=False)
-                    loss = _causal_sum_loss(out.logits, batch["labels"])
-                losses.append(float(loss))
-            pred = int(min(range(len(losses)), key=lambda i: losses[i]))
-            correct += int(pred == int(r.gold_index))
+            losses = _choice_losses(tuner, r, max_length=max_length)
+            pred_norm = int(min(range(len(losses)), key=lambda i: losses[i]["mean_loss"]))
+            pred_sum = int(min(range(len(losses)), key=lambda i: losses[i]["sum_loss"]))
+            correct_norm += int(pred_norm == int(r.gold_index))
+            correct_sum += int(pred_sum == int(r.gold_index))
     finally:
         if tuner.controller is not None:
             tuner.controller.remove()
-    return {"choice_acc": correct / max(1, len(rows)), "choice_n": float(len(rows))}
+    return {
+        "choice_acc": correct_norm / max(1, len(rows)),
+        "choice_acc_len_norm": correct_norm / max(1, len(rows)),
+        "choice_acc_sum_loss": correct_sum / max(1, len(rows)),
+        "choice_n": float(len(rows)),
+    }
+
+
+def _choice_losses(tuner: ForwardFineTuner, row: EvalRow, *, max_length: int) -> list[dict[str, float]]:
+    losses: list[dict[str, float]] = []
+    for choice in row.choices or []:
+        batch = make_batch(
+            tuner.tokenizer,
+            [Example(row.prompt, choice)],
+            device=next(tuner.model.parameters()).device,
+            max_length=max_length,
+        )
+        with torch.no_grad():
+            out = tuner.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"), use_cache=False)
+            loss, tokens = _causal_sum_loss_and_tokens(out.logits, batch["labels"])
+        losses.append({"sum_loss": float(loss), "tokens": float(tokens), "mean_loss": float(loss) / max(1, int(tokens))})
+    if not losses:
+        raise ValueError("multiple-choice row contains no choices")
+    return losses
 
 
 def _causal_sum_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    loss, _tokens = _causal_sum_loss_and_tokens(logits, labels)
+    return loss
+
+
+def _causal_sum_loss_and_tokens(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, int]:
     shift_logits = logits[:, :-1, :].contiguous().float()
     shift_labels = labels[:, 1:].contiguous()
     mask = shift_labels != -100
     if not bool(mask.any()):
-        return torch.tensor(0.0, device=logits.device)
-    return F.cross_entropy(shift_logits[mask], shift_labels[mask], reduction="sum")
+        return torch.tensor(0.0, device=logits.device), 0
+    tokens = int(mask.sum().item())
+    return F.cross_entropy(shift_logits[mask], shift_labels[mask], reduction="sum"), tokens
 
 
 def _retrieval_recall(retriever: MemoryRetriever, task_id: str, rows: Sequence[EvalRow], *, top_k: int) -> dict[str, float]:
@@ -535,6 +612,10 @@ def _token_ngrams(text: str, n: int = 5) -> set[tuple[str, ...]]:
     return {tuple(toks[i:i+n]) for i in range(len(toks) - n + 1)}
 
 
+def _stable_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _leakage_audit(out: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task in manifest["tasks"]:
@@ -543,8 +624,8 @@ def _leakage_audit(out: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
         eval_rows = _load_eval_rows(task["eval_path"])
         train_texts = [(ex.prompt + "\n" + ex.completion) for ex in train]
         eval_texts = [(r.prompt + "\n" + r.completion) for r in eval_rows]
-        train_hashes = {hash(t) for t in train_texts}
-        exact = sum(1 for t in eval_texts if hash(t) in train_hashes)
+        train_hashes = {_stable_text_hash(t) for t in train_texts}
+        exact = sum(1 for t in eval_texts if _stable_text_hash(t) in train_hashes)
         train_grams = [_token_ngrams(t) for t in train_texts]
         max_j = []
         for et in eval_texts:
@@ -636,11 +717,11 @@ def _compose_for_query(
     weighting: str,
     temperature: float,
     max_log_gate: float | None,
-) -> tuple[SignedLogMaskState, list[MemoryHit]]:
+) -> tuple[SignedLogMaskState | None, list[MemoryHit]]:
     hits = retriever.search(query, top_k=top_k)
     hits = store.weight_hits(hits, weighting=weighting, temperature=temperature)
     if not hits:
-        raise ValueError("memory retrieval returned no controllers")
+        return None, []
     states = [SignedLogMaskState.load(store.controller_path(h.item), map_location="cpu") for h in hits]
     state = compose_states(states, weights=[h.weight for h in hits], max_log_gate=max_log_gate)
     return state, hits
@@ -773,8 +854,9 @@ def _choice_accuracy_retrieved_per_example(
 ) -> dict[str, float]:
     rows = [r for r in rows if r.choices is not None and r.gold_index is not None]
     if not rows:
-        return {"choice_acc": math.nan, "choice_n": 0.0}
-    correct = 0
+        return {"choice_acc": math.nan, "choice_acc_len_norm": math.nan, "choice_acc_sum_loss": math.nan, "choice_n": 0.0}
+    correct_norm = 0
+    correct_sum = 0
     for r in rows:
         raw = retriever.search(r.query, top_k=top_k)
         hits = store.weight_hits(raw, weighting=weighting, temperature=temperature)
@@ -786,19 +868,20 @@ def _choice_accuracy_retrieved_per_example(
         if tuner.controller is not None:
             tuner.controller.attach()
         try:
-            losses = []
-            for choice in r.choices or []:
-                batch = make_batch(tuner.tokenizer, [Example(r.prompt, choice)], device=next(tuner.model.parameters()).device, max_length=max_length)
-                with torch.no_grad():
-                    out = tuner.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"), use_cache=False)
-                    loss = _causal_sum_loss(out.logits, batch["labels"])
-                losses.append(float(loss))
-            pred = int(min(range(len(losses)), key=lambda i: losses[i]))
-            correct += int(pred == int(r.gold_index))
+            losses = _choice_losses(tuner, r, max_length=max_length)
+            pred_norm = int(min(range(len(losses)), key=lambda i: losses[i]["mean_loss"]))
+            pred_sum = int(min(range(len(losses)), key=lambda i: losses[i]["sum_loss"]))
+            correct_norm += int(pred_norm == int(r.gold_index))
+            correct_sum += int(pred_sum == int(r.gold_index))
         finally:
             if tuner.controller is not None:
                 tuner.controller.remove()
-    return {"choice_acc": correct / max(1, len(rows)), "choice_n": float(len(rows))}
+    return {
+        "choice_acc": correct_norm / max(1, len(rows)),
+        "choice_acc_len_norm": correct_norm / max(1, len(rows)),
+        "choice_acc_sum_loss": correct_sum / max(1, len(rows)),
+        "choice_n": float(len(rows)),
+    }
 
 
 def cmd_eval(args) -> None:
@@ -813,8 +896,27 @@ def cmd_eval(args) -> None:
         hybrid_alpha=args.hybrid_alpha,
         batch_size=args.embedding_batch_size,
     )
-    model, tok = _load_model(args.model, args.device, args.dtype)
-    tuner = ForwardFineTuner(model, tok, gates=args.gates, layers=args.layers, max_log_gate=args.max_log_gate)
+    model, tok = _load_model(
+        args.model,
+        args.device,
+        args.dtype,
+        trust_remote_code=getattr(args, "trust_remote_code", False),
+        revision=getattr(args, "revision", None),
+        tokenizer_revision=getattr(args, "tokenizer_revision", None),
+        local_files_only=getattr(args, "local_files_only", False),
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    tuner = ForwardFineTuner(
+        model,
+        tok,
+        gates=args.gates,
+        layers=args.layers,
+        max_log_gate=args.max_log_gate,
+        model_name=args.model,
+        model_revision=getattr(args, "revision", None),
+        tokenizer_name=args.model,
+        tokenizer_revision=getattr(args, "tokenizer_revision", None) or getattr(args, "revision", None),
+    )
 
     states: dict[str, SignedLogMaskState] = {}
     task_rows: dict[str, list[EvalRow]] = {}
@@ -897,6 +999,8 @@ def cmd_eval(args) -> None:
                 "token_acc": metrics.get("token_acc"),
                 "tokens": metrics.get("tokens"),
                 "choice_acc": cmetrics.get("choice_acc", math.nan),
+                "choice_acc_len_norm": cmetrics.get("choice_acc_len_norm", math.nan),
+                "choice_acc_sum_loss": cmetrics.get("choice_acc_sum_loss", math.nan),
                 "choice_n": cmetrics.get("choice_n", 0.0),
                 "nll_delta_vs_base": metrics.get("nll") - base.get("nll"),
                 "retrieved_ids": hit_ids,
@@ -935,6 +1039,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
     def common_model(q):
         q.add_argument("--model", default=os.environ.get("MODEL", "Qwen/Qwen2.5-0.5B-Instruct"))
+        q.add_argument("--revision", default=os.environ.get("REVISION") or None)
+        q.add_argument("--tokenizer-revision", default=os.environ.get("TOKENIZER_REVISION") or None)
+        q.add_argument("--cache-dir", default=os.environ.get("CACHE_DIR") or None)
+        q.add_argument("--local-files-only", action="store_true", default=os.environ.get("LOCAL_FILES_ONLY", "0") == "1")
+        q.add_argument("--trust-remote-code", action="store_true", default=os.environ.get("TRUST_REMOTE_CODE", "0") == "1")
         q.add_argument("--device", default=os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
         q.add_argument("--dtype", default=os.environ.get("DTYPE", "bf16"), choices=["auto", "bf16", "fp16", "fp32"])
         q.add_argument("--gates", type=int, default=int(os.environ.get("GATES", "21000")))

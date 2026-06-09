@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -19,14 +19,158 @@ class Example:
         {"prompt": "Question...\nAnswer:", "completion": " worked solution..."}
 
     A row with only {"text": ...} is also accepted; all tokens after the
-    first one are supervised.
+    first one are supervised. Chat rows with {"messages": [...]} are accepted
+    by :func:`load_jsonl_examples`; by default they train only on the final
+    assistant turn and use the tokenizer chat template when one is available.
     """
 
     prompt: str
     completion: str
 
 
-def load_jsonl_examples(path: str | Path) -> list[Example]:
+_ROLE_ORDER = {"system", "user", "assistant", "tool"}
+
+
+def _require_str(row: Mapping[str, Any], key: str, *, path: Path, line: int) -> str:
+    if key not in row:
+        raise ValueError(f"{path}:{line} missing required key {key!r}")
+    value = row[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{path}:{line} key {key!r} must be a string")
+    return value
+
+
+def _normalise_messages(row: Mapping[str, Any], *, path: Path, line: int) -> list[dict[str, str]]:
+    raw = row.get("messages")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{path}:{line} messages must be a non-empty list")
+    out: list[dict[str, str]] = []
+    for i, msg in enumerate(raw):
+        if not isinstance(msg, Mapping):
+            raise ValueError(f"{path}:{line} messages[{i}] must be an object")
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(role, str) or role not in _ROLE_ORDER:
+            raise ValueError(f"{path}:{line} messages[{i}].role must be one of {sorted(_ROLE_ORDER)}")
+        if not isinstance(content, str):
+            raise ValueError(f"{path}:{line} messages[{i}].content must be a string")
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _render_messages_plain(messages: Sequence[Mapping[str, str]]) -> str:
+    """Dependency-free fallback chat serialization.
+
+    This is intentionally explicit rather than pretending to match a model's
+    native chat template. It is used only when the user opts out of templates or
+    no tokenizer/template is available.
+    """
+
+    return "".join(f"{m['role']}: {m['content']}\n" for m in messages)
+
+
+def _has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None)) and callable(getattr(tokenizer, "apply_chat_template", None))
+
+
+def chat_messages_to_example(
+    messages: Sequence[Mapping[str, str]],
+    *,
+    tokenizer=None,
+    chat_template: str = "auto",
+    loss_on: str = "assistant",
+) -> Example:
+    """Convert a chat row into an :class:`Example`.
+
+    Parameters
+    ----------
+    messages:
+        OpenAI/HF-style messages with role/content keys.
+    tokenizer:
+        Optional tokenizer. When ``chat_template='auto'`` and the tokenizer has
+        ``apply_chat_template``, the prompt side is rendered with the model's
+        native template.
+    chat_template:
+        ``'auto'`` uses tokenizer.apply_chat_template when available. ``'none'``
+        uses a simple role-prefixed fallback serialization.
+    loss_on:
+        ``'assistant'`` trains only on the final assistant message. ``'all'``
+        trains on the complete rendered conversation.
+    """
+
+    if chat_template not in {"auto", "none"}:
+        raise ValueError("chat_template must be 'auto' or 'none'")
+    if loss_on not in {"assistant", "all"}:
+        raise ValueError("loss_on must be 'assistant' or 'all'")
+    msgs = [dict(m) for m in messages]
+    if not msgs:
+        raise ValueError("messages must be non-empty")
+
+    if loss_on == "all":
+        if chat_template == "auto" and tokenizer is not None and _has_chat_template(tokenizer):
+            text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+        else:
+            text = _render_messages_plain(msgs)
+        return Example("", str(text))
+
+    # Train on the final assistant turn only. This is the safest default for
+    # chat/instruct models: user/system/tool tokens are context, not targets.
+    assistant_idx = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+    if not assistant_idx:
+        raise ValueError("loss_on='assistant' requires at least one assistant message")
+    last = assistant_idx[-1]
+    prompt_msgs = msgs[:last]
+    completion = str(msgs[last]["content"])
+    if not completion:
+        raise ValueError("final assistant message is empty")
+    if chat_template == "auto" and tokenizer is not None and _has_chat_template(tokenizer):
+        prompt = tokenizer.apply_chat_template(prompt_msgs, tokenize=False, add_generation_prompt=True)
+    else:
+        prompt = _render_messages_plain(prompt_msgs) + "assistant:"
+    # Ensure ordinary chat completions separate from the assistant marker under
+    # the fallback serializer. Native chat templates decide their own spacing.
+    if not completion.startswith((" ", "\n", "\t")) and not (chat_template == "auto" and tokenizer is not None and _has_chat_template(tokenizer)):
+        completion = " " + completion
+    return Example(str(prompt), completion)
+
+
+def _row_to_example(
+    row: Mapping[str, Any],
+    *,
+    path: Path,
+    line: int,
+    tokenizer=None,
+    chat_template: str = "auto",
+    loss_on: str = "assistant",
+) -> Example:
+    if "messages" in row:
+        return chat_messages_to_example(
+            _normalise_messages(row, path=path, line=line),
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            loss_on=loss_on,
+        )
+    if "prompt" in row and "completion" in row:
+        return Example(_require_str(row, "prompt", path=path, line=line), _require_str(row, "completion", path=path, line=line))
+    if "instruction" in row and "response" in row:
+        return Example(_require_str(row, "instruction", path=path, line=line), _require_str(row, "response", path=path, line=line))
+    if "question" in row and "answer" in row:
+        return Example(str(row["question"]).rstrip() + "\nAnswer:", " " + str(row["answer"]))
+    if "text" in row:
+        return Example("", _require_str(row, "text", path=path, line=line))
+    raise ValueError(
+        f"{path}:{line} must contain prompt/completion, instruction/response, "
+        "question/answer, text, or messages"
+    )
+
+
+def load_jsonl_examples(
+    path: str | Path,
+    *,
+    tokenizer=None,
+    chat_template: str = "auto",
+    loss_on: str = "assistant",
+) -> list[Example]:
     """Load examples from JSONL.
 
     Accepted schemas:
@@ -34,7 +178,14 @@ def load_jsonl_examples(path: str | Path) -> list[Example]:
       - {"instruction": str, "response": str}
       - {"question": str, "answer": str}
       - {"text": str}
+      - {"messages": [{"role": ..., "content": ...}, ...]}
+
+    Chat rows train on the final assistant turn by default. Pass a tokenizer to
+    use its chat template; otherwise a transparent role-prefixed fallback is
+    used. This function validates row types eagerly so data errors fail before a
+    model is loaded for long training runs.
     """
+
     out: list[Example] = []
     p = Path(path)
     with p.open("r", encoding="utf-8") as f:
@@ -42,20 +193,22 @@ def load_jsonl_examples(path: str | Path) -> list[Example]:
             line = line.strip()
             if not line:
                 continue
-            row = json.loads(line)
-            if "prompt" in row and "completion" in row:
-                out.append(Example(str(row["prompt"]), str(row["completion"])))
-            elif "instruction" in row and "response" in row:
-                out.append(Example(str(row["instruction"]), str(row["response"])))
-            elif "question" in row and "answer" in row:
-                out.append(Example(str(row["question"]).rstrip() + "\nAnswer:", " " + str(row["answer"])))
-            elif "text" in row:
-                out.append(Example("", str(row["text"])))
-            else:
-                raise ValueError(
-                    f"{p}:{i} must contain prompt/completion, instruction/response, "
-                    "question/answer, or text"
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{p}:{i} invalid JSON: {exc.msg}") from exc
+            if not isinstance(row, Mapping):
+                raise ValueError(f"{p}:{i} JSONL row must be an object")
+            out.append(
+                _row_to_example(
+                    row,
+                    path=p,
+                    line=i,
+                    tokenizer=tokenizer,
+                    chat_template=chat_template,
+                    loss_on=loss_on,
                 )
+            )
     if not out:
         raise ValueError(f"no examples found in {p}")
     return out
@@ -103,10 +256,17 @@ def encode_example(tokenizer, ex: Example, max_length: int = 1024) -> tuple[torc
 
 def ensure_pad_token(tokenizer) -> None:
     if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is not None:
+        eos_token = getattr(tokenizer, "eos_token", None)
+        if tokenizer.eos_token_id is not None and eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         else:
-            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            raise ValueError(
+                "tokenizer has neither pad_token_id nor eos_token_id; set a pad token before batching. "
+                "ntkmirror does not add new special tokens implicitly because the model embeddings "
+                "would also need to be resized."
+            )
 
 
 def make_batch(

@@ -7,7 +7,7 @@ from typing import Sequence
 
 import torch
 
-from .memory import ControllerMemoryStore, MemoryHit, MemoryItem, lexical_tokens
+from .memory import DEFAULT_MIN_SCORE, ControllerMemoryStore, MemoryHit, MemoryItem, lexical_tokens
 
 
 @dataclass
@@ -25,7 +25,11 @@ def _normalise01(scores: dict[str, float]) -> dict[str, float]:
     vals = list(scores.values())
     lo, hi = min(vals), max(vals)
     if hi <= lo + 1e-12:
-        return {k: 0.0 for k in scores}
+        # Preserve a meaningful singleton/all-tied positive signal. Returning all
+        # zeros here causes hybrid retrieval with one clearly matching memory to
+        # be filtered as a no-hit by the default positive min_score.
+        val = 1.0 if hi > 0.0 else 0.0
+        return {k: val for k in scores}
     return {k: (v - lo) / (hi - lo) for k, v in scores.items()}
 
 
@@ -137,7 +141,9 @@ class MemoryRetriever:
             out[item.id] = float(torch.dot(q, self._doc_embeddings[row]).item())
         return out
 
-    def search(self, query: str, *, top_k: int = 3, tag: str | None = None, min_score: float = 0.0) -> list[MemoryHit]:
+    def search(self, query: str, *, top_k: int = 3, tag: str | None = None, min_score: float = DEFAULT_MIN_SCORE) -> list[MemoryHit]:
+        if int(top_k) <= 0:
+            return []
         items = self.items
         if tag:
             items = [x for x in items if tag in set(x.tags)]
@@ -157,7 +163,7 @@ class MemoryRetriever:
             scores = {item.id: a * emb_n.get(item.id, 0.0) + (1.0 - a) * lex_n.get(item.id, 0.0) for item in items}
 
         by_id = {item.id: item for item in items}
-        hits = [MemoryHit(item=by_id[mid], score=float(score), weight=1.0) for mid, score in scores.items() if score >= min_score]
+        hits = [MemoryHit(item=by_id[mid], score=float(score), weight=1.0) for mid, score in scores.items() if score >= float(min_score)]
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[: max(0, int(top_k))]
 

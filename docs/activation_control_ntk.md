@@ -46,8 +46,12 @@ reachability evidence. The default is `--jvp-mode exact`.
 The solver reports separate residuals:
 
 - `range_residual`: local linear range residual, `||d - B u|| / ||d||`.
-- `realized_residual`: actual forward residual, `||d - (F(s+u)-F(s))|| / ||d||`.
-- `field_residual`: alias for `realized_residual`.
+- `realized_residual`: unconstrained actual forward residual, `||d - (F(s+u)-F(s))|| / ||d||`.
+- `clipped_realized_residual`: actual forward residual after applying the same
+  signed-log box constraint used by controller application.
+- `field_residual`: safety-facing alias for `clipped_realized_residual`.
+- `box_clip_fraction` and `box_active_fraction`: how much of the solved update
+  or resulting state hits the signed-log box constraint.
 - `adjoint_error`: random-probe check of `<Bv,y> = <v,B^T y>`.
 - `symmetry_error`: random-probe check of `a^T K b = b^T K a`.
 - `clip_fraction` and `clip_update_residual` in `fit-dual`: whether the solved
@@ -160,5 +164,6 @@ divisor.
    `topk` first, and optionally `--param-filter` for ablations.
 9. **Hook-site mismatch.** `layer_output` preserves existing controllers; for
    theorem-facing activation-input claims, run `layer_input` ablations.
-10. **Controller clipping.** If `clip_fraction` is high, the applied step is not
-    the solved step.
+10. **Controller clipping.** If `box_clip_fraction` or `clip_fraction` is high,
+    the applied step is not the unconstrained solved step. Interpret
+    `clipped_realized_residual`, not only `realized_residual`.

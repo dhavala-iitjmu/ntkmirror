@@ -29,13 +29,16 @@ HYBRID_ALPHA=0.65
 MEMORY_TEXT_MODE=descriptor_prompts
 MEMORY_TRAIN_SNIPPETS=32
 TOP_K=1
+REVISION=<model-commit-sha-or-tag>
+TOKENIZER_REVISION=<tokenizer-commit-sha-or-tag>
+TRUST_REMOTE_CODE=0
 ```
 
 The benchmark also writes `retrieval_method_comparison.csv`, so lexical, embedding, and hybrid recall are visible side-by-side.
 
 ## Outputs
 
-- `summary.csv`: base/gold/retrieved/composed metrics by task. `retrieved_query_memory` is the realistic per-example retrieval path; `retrieved_descriptor_memory` is a diagnostic only.
+- `summary.csv`: base/gold/retrieved/composed metrics by task. `retrieved_query_memory` is the realistic per-example retrieval path; `retrieved_descriptor_memory` is a diagnostic only. Multiple-choice `choice_acc` is length-normalized; `choice_acc_sum_loss` is also reported for transparency.
 - `cross_task_nll.csv`: every memory controller applied to every evaluation task.
 - `retrieval_recall.csv`: top-1/top-k recall for the selected retrieval method.
 - `retrieval_method_comparison.csv`: recall comparison for lexical, embedding, and hybrid retrieval.
@@ -54,3 +57,4 @@ The benchmark also writes `retrieval_method_comparison.csv`, so lexical, embeddi
 3. **Composition saturation.** If `clip_frac_active` is high, summed memories are saturating the log-gate budget.
 4. **Gate collision.** If pairwise gate cosine is high and composed performance drops, the task controllers interfere geometrically.
 5. **Leakage.** Exact and 5-gram train/eval overlap are audited before interpreting memory gains.
+6. **Choice length bias.** Length-normalized multiple-choice accuracy is the default; summed-loss accuracy is reported separately so length effects are visible.

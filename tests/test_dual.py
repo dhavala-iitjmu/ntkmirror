@@ -16,6 +16,37 @@ def test_logit_projection_target_and_full_shapes():
     assert apply_logit_projection(logits, labels, full).numel() == full.field_dim
 
 
+def test_topk_projection_does_not_duplicate_gold_token():
+    logits = torch.zeros(1, 3, 5)
+    logits[0, 0, 2] = 10.0  # gold is also the baseline top token
+    logits[0, 0, 1] = 9.0
+    logits[0, 0, 3] = 8.0
+    labels = torch.tensor([[-100, 2, -100]])
+    spec = build_logit_projection(logits, labels, mode="topk", top_k=2)
+    assert spec.indices is not None
+    row = spec.indices[0].tolist()
+    assert row[0] == 2
+    assert len(row) == len(set(row))
+    assert row == [2, 1, 3]
+
+
+def test_logit_topk_projection_deduplicates_gold_token():
+    logits = torch.zeros(1, 3, 5)
+    labels = torch.tensor([[-100, 2, 3]])
+    # Make each gold token the highest baseline logit. The old top-k path would
+    # include it twice: once as the forced gold coordinate and once from topk.
+    logits[0, 0, 2] = 10.0
+    logits[0, 0, 4] = 9.0
+    logits[0, 1, 3] = 8.0
+    logits[0, 1, 1] = 7.0
+    spec = build_logit_projection(logits, labels, mode="topk", top_k=2)
+    assert spec.indices is not None
+    for row in spec.indices.tolist():
+        assert len(row) == len(set(row))
+    assert spec.indices[0].tolist().count(2) == 1
+    assert spec.indices[1].tolist().count(3) == 1
+
+
 def test_cg_solve_spd_system():
     a = torch.tensor([[4.0, 1.0], [1.0, 3.0]])
     b = torch.tensor([1.0, 2.0])
@@ -34,6 +65,10 @@ def test_signed_log_override_and_state_backward_compatibility():
         max_log_gate=0.1,
         hook_site="layer_output",
     )
+    assert [name for name, _ in module.named_parameters()] == ["raw"]
+    assert "layers" not in dict(module.named_modules())
+    assert all(not key.startswith("layers.") for key in module.state_dict())
+
     x = torch.ones(1, 1, 3)
     module.attach()
     try:
@@ -56,6 +91,39 @@ def test_signed_log_override_and_state_backward_compatibility():
     state = SignedLogMaskState.from_dict(old_payload)
     assert state.hook_site == "layer_output"
     assert state.theory_version == "activation_control"
+
+
+def test_signed_log_state_validation_rejects_bad_payloads():
+    base = {
+        "layer_path": "model.layers",
+        "n_layers": 1,
+        "hidden_size": 3,
+        "layer_indices": torch.tensor([0]),
+        "channel_indices": torch.tensor([1]),
+        "raw": torch.tensor([0.0]),
+        "max_log_gate": 0.1,
+    }
+    bad_dup = dict(base)
+    bad_dup.update({
+        "layer_indices": torch.tensor([0, 0]),
+        "channel_indices": torch.tensor([1, 1]),
+        "raw": torch.tensor([0.0, 0.0]),
+    })
+    try:
+        SignedLogMaskState.from_dict(bad_dup)
+    except ValueError as e:
+        assert "duplicate gate" in str(e)
+    else:  # pragma: no cover
+        raise AssertionError("duplicate gates should be rejected")
+
+    bad_nan = dict(base)
+    bad_nan["raw"] = torch.tensor([float("nan")])
+    try:
+        SignedLogMaskState.from_dict(bad_nan)
+    except ValueError as e:
+        assert "NaN" in str(e) or "Inf" in str(e)
+    else:  # pragma: no cover
+        raise AssertionError("NaN raw values should be rejected")
 
 
 class _ToyOut:
@@ -134,6 +202,63 @@ def test_exact_jvp_vjp_projection_solver_has_small_adjoint_and_symmetry_error():
     assert d.symmetry_error < 1e-5
     assert d.range_residual < 1e-4
     assert d.realized_residual < 5e-3
+
+
+def test_projection_solver_reports_box_clipped_realization():
+    from ntkmirror.dual import solve_gate_projection_matrix_free
+
+    torch.manual_seed(3)
+    model = _ToyLM()
+    controller = _SignedLogMaskModule(
+        model.layers,
+        torch.tensor([0]),
+        torch.tensor([1]),
+        hidden_size=4,
+        max_log_gate=1e-4,
+        hook_site="layer_output",
+    )
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "labels": torch.tensor([[-100, 2, 3, 4]], dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+    }
+    controller.attach()
+    try:
+        base_logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False).logits
+        spec = build_logit_projection(base_logits, batch["labels"], mode="target")
+        s0 = controller.s.detach().float()
+
+        def field(x):
+            with controller.temporary_signed_log_values(x):
+                logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False).logits
+                return apply_logit_projection(logits, batch["labels"], spec)
+
+        _, target = torch.autograd.functional.jvp(
+            field,
+            (s0.detach().clone().requires_grad_(True),),
+            (torch.tensor([1e-1]),),
+            create_graph=False,
+            strict=False,
+        )
+    finally:
+        controller.remove()
+
+    sol = solve_gate_projection_matrix_free(
+        model,
+        batch,
+        spec,
+        controller,
+        target.detach(),
+        ridge=1e-12,
+        cg_iters=16,
+        cg_tol=1e-9,
+        jvp_mode="exact",
+    )
+    d = sol.diagnostics
+    assert d.box_clip_fraction > 0.0
+    assert d.box_active_fraction > 0.0
+    assert d.clipped_realized_residual >= d.realized_residual
+    assert sol.clipped_realized_field is not None
 
 
 def test_metric_projection_uses_metric_inverse_solution_shape():

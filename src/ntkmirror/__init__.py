@@ -1,16 +1,41 @@
+from .artifacts import controller_summary, doctor_model, lint_controller, lint_state, write_controller_card
+from .compose import compose_states, composition_plan, composition_report
 from .controller import ForwardFineTuner, SignedLogMaskState
-from .data import Example, load_jsonl_examples
-from .compose import compose_states, composition_report
-from .memory import ControllerMemoryStore, MemoryItem, MemoryHit
+from .data import Example, chat_messages_to_example, load_jsonl_examples
 from .dual import build_logit_projection, solve_controller_field_update
+from .isr import (
+    EvidenceClaim,
+    HFChoiceVerifierBackend,
+    ISROptionalDependencyError,
+    KVDebiasResult,
+    KVDeltaBayesNTKBackendAdapter,
+    SUPPORT_QUERY,
+    YESNO,
+    auroc,
+    load_evidence_claims_jsonl,
+    load_isr_dataset,
+    run_isr_auc,
+    score_claim,
+    score_kv_debias_probability,
+    solve_ridge_projection,
+    summarize_rows,
+    tpr_at_leak,
+    verbalize,
+)
+from .memory import ControllerMemoryStore, MemoryHit, MemoryItem
 from .retrieval import MemoryRetriever, RetrievalConfig, build_memory_retriever
+from .runtime import ControllerRuntime, RuntimePolicy
 
 __all__ = [
     "ForwardFineTuner",
     "SignedLogMaskState",
+    "ControllerRuntime",
+    "RuntimePolicy",
     "Example",
+    "chat_messages_to_example",
     "load_jsonl_examples",
     "compose_states",
+    "composition_plan",
     "composition_report",
     "ControllerMemoryStore",
     "MemoryItem",
@@ -20,4 +45,26 @@ __all__ = [
     "build_memory_retriever",
     "build_logit_projection",
     "solve_controller_field_update",
+    "controller_summary",
+    "doctor_model",
+    "lint_controller",
+    "lint_state",
+    "EvidenceClaim",
+    "HFChoiceVerifierBackend",
+    "ISROptionalDependencyError",
+    "KVDebiasResult",
+    "KVDeltaBayesNTKBackendAdapter",
+    "SUPPORT_QUERY",
+    "YESNO",
+    "auroc",
+    "load_evidence_claims_jsonl",
+    "load_isr_dataset",
+    "run_isr_auc",
+    "score_claim",
+    "score_kv_debias_probability",
+    "solve_ridge_projection",
+    "summarize_rows",
+    "tpr_at_leak",
+    "verbalize",
+    "write_controller_card",
 ]

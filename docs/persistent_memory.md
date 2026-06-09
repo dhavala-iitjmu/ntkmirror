@@ -50,13 +50,15 @@ They are most natural for compact procedural, stylistic, preference, or
 domain-adaptation memories: a user's formatting preference, a document's local
 terminology, a coding style, a narrow math procedure, or a recurring task
 pattern. They are not a replacement for factual retrieval when the answer needs
-verbatim evidence. For facts, use prompt/RAG provenance; for behaviour, style,
-and local adaptation, use controller memory.
+verbatim evidence, dates, citations, or source attribution. For facts, use
+prompt/RAG provenance; for behaviour, style, and local adaptation, use
+controller memory.
 
 ## Failure hypotheses to test
 
 1. **Retrieval error.** The selected controllers are irrelevant. Always inspect
-   `ntkmirror memory search` before blaming the controller.
+   `ntkmirror memory search` before blaming the controller. If no positive-score
+   memory is found, generation/evaluation should fall back to the base model.
 
 2. **Composition interference.** Two relevant controllers may push overlapping
    gates in opposite directions. Use `ntkmirror inspect` on candidate controllers
@@ -72,9 +74,10 @@ and local adaptation, use controller memory.
    it does not insert missing strings into the context. If the answer requires a
    quote or a date, put that evidence in the prompt.
 
-6. **Stale or poisoned memory.** A controller is executable model state. Keep the
-   memory store trusted, versioned, and deletable. Do not load untrusted `.pt`
-   files.
+6. **Stale or poisoned memory.** A controller is executable-adjacent model
+   state. Keep the memory store trusted, versioned, and deletable. Do not load
+   untrusted `.pt` files, and keep controller artifacts bound to the model and
+   tokenizer revision they were trained against.
 
 7. **Task non-orthogonality.** Disjoint controllers compose best when their
    induced directions are weakly interfering. For overlapping skills, evaluate

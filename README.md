@@ -23,6 +23,11 @@ cd ntkmirror
 pip install -e .
 ```
 
+By default the CLI loads Hugging Face models with `trust_remote_code=False`. Use
+`--trust-remote-code` only for repositories you trust, and pin reproducible
+experiments with `--revision <commit-sha-or-tag>` and, when needed,
+`--tokenizer-revision <commit-sha-or-tag>`.
+
 ## Minimal use
 
 Create `train.jsonl`:
@@ -105,6 +110,12 @@ Also accepted:
 {"text":"..."}
 ```
 
+`ntkmirror` trains on explicit supervised targets. Raw `prompt` / `completion`
+rows are used as written. Chat rows with `messages` are also accepted; by
+default only the final assistant message is supervised, and `--chat-template
+auto` uses the tokenizer chat template when one is available. Use
+`--chat-template none` for the transparent role-prefixed fallback serializer.
+
 ## Important defaults
 
 | Option | Default | Meaning |
@@ -146,13 +157,57 @@ them, and evaluates base / task-A / task-B / composed controllers on both eval
 sets. See `docs/composability.md`.
 
 
+
+## V2 operating layer
+
+The v2 operating layer adds request-scoped controller runtime isolation,
+controller linting/cards, model compatibility doctor reports, validation and
+retain-data training hygiene, safer composition planning, and memory namespaces
+with versioning / soft delete / rollback / audit. See
+[`docs/v2_operating_layer.md`](docs/v2_operating_layer.md).
+
+Useful commands:
+
+```bash
+ntkmirror doctor --model Qwen/Qwen2.5-0.5B-Instruct --out doctor.json
+ntkmirror lint --controller controller.pt --require-revision --out lint.json
+ntkmirror card --controller controller.pt --out controller.card.md
+ntkmirror compose-plan --controllers a.pt b.pt --out plan.json
+ntkmirror memory audit --store runs/memory --out memory_audit.json
+```
+
+## ISR verifier and KV order-debias
+
+V2 includes an evidence-support verifier benchmark derived from the ISR/KV AUC
+prototype. It reports canonical verifier probability, order-marginalized
+probability, an ISR dispersion-penalized score, and, when the optional legacy
+`kv_delta_bayes_ntk` backend is available, a closed-form NTK KV order-debias
+score. See [`docs/isr_kv_verifier.md`](docs/isr_kv_verifier.md).
+
+```bash
+ntkmirror isr-auc \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset vitaminc \
+  --n 200 \
+  --num-orderings 6 \
+  --out runs/isr_vitaminc.json
+```
+
+For the KV path, run with `--backend kv-delta-bayes-ntk --fit-controller` and
+place the legacy controller package on `PYTHONPATH`. The CLI refuses to ignore
+unsupported reproducibility/security flags on that backend. Raw claims/evidence
+are omitted from outputs unless `--include-raw` is set.
+
 ## Persistent controller memory
 
 A memory item can be stored as a controller: one controller per conversation,
 document, user preference, task style, or procedure. At inference time,
 `ntkmirror` retrieves relevant items, composes their signed log-gates, and
-attaches the composed controller before generation. This injects retrieved
-context through the forward pass without appending the memory text to the prompt.
+attaches the composed controller before generation. This biases the forward pass
+without appending memory text to the prompt. Treat it as a behavioral/style or
+procedure-control mechanism, not as a substitute for factual retrieval, source
+provenance, or RAG when factual grounding matters. By default zero-score memory
+retrievals are treated as no-hit rather than attaching arbitrary controllers.
 
 Fit-and-store a memory controller:
 
@@ -199,8 +254,11 @@ bash examples/run_memory_demo.sh
 The default retriever is a dependency-free lexical TF-IDF scorer. That is
 intentional for first-run UX: the main bottleneck in controller memory is
 retrieval quality, not controller storage. For production, replace the retriever
-with an embedding or hybrid vector-store layer and keep the same `compose_states`
-interface. See `docs/persistent_memory.md`.
+with an embedding or hybrid vector-store layer, enforce provenance policies, and
+keep the same `compose_states` interface. Controller stores are a trust boundary:
+load controllers only from trusted stores, because stale, poisoned, or
+checkpoint-incompatible controllers can silently degrade model behavior. See
+`docs/persistent_memory.md`.
 
 
 ## Activation-control NTK tools
@@ -222,9 +280,10 @@ d_C^theta = -eta J_{theta,C} J_{theta,S}^T g_S .
 
 `Bv` is an exact autograd JVP, `B^T y` is an exact VJP, and the CG operator is
 `B M^{-1} B^T + ridge I`. Reports include `adjoint_error`, `symmetry_error`,
-`range_residual`, and the actual forward `realized_residual`; `field_residual`
-is the realised-forward residual, not the same local matvec used inside the
-solve.
+`range_residual`, the unconstrained forward `realized_residual`, and the
+box-constrained `clipped_realized_residual`. `field_residual` is the
+safety-facing clipped forward residual, not the same local matvec used inside
+the solve.
 
 Audit whether a selected gate basis can realise the full-weight field:
 
@@ -291,9 +350,12 @@ not the default first-run path.
 
 ## Notes for benchmark claims
 
-Always report the base model, controller, and LoRA on the same train/eval
+Always report the base model, controller, LoRA/SFT baseline, random-gate
+control, wrong-memory control, and no-retrieval fallback on the same train/eval
 manifest. For exact-answer tasks, report exact accuracy and teacher-forced NLL.
-For system claims, report adaptation time and peak memory. See
+For multiple-choice tasks, prefer length-normalized choice NLL and also disclose
+summed-loss accuracy. For system claims, report adaptation time, peak memory,
+model revision, tokenizer revision, dataset hashes, and retrieval settings. See
 `docs/method.md` for failure modes.
 
 ## Citation

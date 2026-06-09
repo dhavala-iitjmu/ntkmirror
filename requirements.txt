@@ -1,7 +1,8 @@
+numpy>=1.24
 torch>=2.3
 transformers>=4.43
 accelerate>=0.30
 safetensors>=0.4
-datasets>=2.19
+datasets>=2.20
 pandas>=2.0
 sentence-transformers>=3.0

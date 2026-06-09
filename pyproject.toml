@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ntkmirror"
-version = "0.3.0"
+version = "0.4.0"
 description = "LoRA-free forward-pass fine-tuning with signed log-mask controllers for Hugging Face causal language models. Hassana Labs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ license = {text = "MIT"}
 authors = [{name = "Leon Chlon", email = "lc574@cantab.ac.uk"}]
 maintainers = [{name = "Leon Chlon", email = "lc574@cantab.ac.uk"}]
 dependencies = [
+  "numpy>=1.24",
   "torch>=2.3",
   "transformers>=4.43",
   "accelerate>=0.30",
@@ -19,10 +20,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-datasets = ["datasets>=2.20"]
+datasets = ["datasets>=2.20", "pandas>=2.0"]
 retrieval = ["sentence-transformers>=3.0"]
 diffusion = ["diffusers>=0.30", "pillow>=10"]
-dev = ["pytest>=8", "ruff>=0.5"]
+benchmark = ["datasets>=2.20", "pandas>=2.0", "sentence-transformers>=3.0"]
+isr = ["datasets>=2.20", "numpy>=1.24"]
+dev = ["pytest>=8", "ruff>=0.5", "coverage>=7"]
+all = [
+  "datasets>=2.20",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "sentence-transformers>=3.0",
+  "diffusers>=0.30",
+  "pillow>=10",
+]
 
 [project.scripts]
 ntkmirror = "ntkmirror.cli:main"
