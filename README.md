@@ -193,6 +193,22 @@ ntkmirror isr-auc \
   --out runs/isr_vitaminc.json
 ```
 
+Score your own claims with `--data-jsonl`. Each line is one JSON object: a
+`claim`, its evidence (a `spans` list or a single `evidence` string), and the
+gold label (`supported` true/false, or `label` supported/refuted).
+
+```jsonl
+{"claim": "The answer is Paris.", "spans": ["Paris is the capital of France."], "supported": true}
+{"claim": "The answer is Rome.", "evidence": "Paris is the capital of France.", "label": "refuted"}
+```
+
+```bash
+ntkmirror isr-auc \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --data-jsonl claims.jsonl \
+  --out runs/isr_custom.json
+```
+
 For the KV path, run with `--backend kv-delta-bayes-ntk --fit-controller` and
 place the legacy controller package on `PYTHONPATH`. The CLI refuses to ignore
 unsupported reproducibility/security flags on that backend. Raw claims/evidence
