@@ -13,7 +13,6 @@ from ntkmirror.isr import (
     score_claim,
     score_kv_debias_probability,
     solve_ridge_projection,
-    summarize_rows,
     tpr_at_leak,
     verbalize,
 )
