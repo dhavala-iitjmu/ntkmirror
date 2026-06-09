@@ -176,10 +176,11 @@ ntkmirror compose-plan --controllers a.pt b.pt --out plan.json
 ntkmirror memory audit --store runs/memory --out memory_audit.json
 ```
 
-## ISR verifier and KV order-debias
+## Hallucination detection
 
-V2 includes an evidence-support verifier benchmark derived from the ISR/KV AUC
-prototype. It reports canonical verifier probability, order-marginalized
+V2 adds a hallucination detector: an evidence-support verifier that scores
+whether a claim is grounded in its evidence. It reports canonical verifier
+probability, order-marginalized
 probability, an ISR dispersion-penalized score, and, when the optional legacy
 `kv_delta_bayes_ntk` backend is available, a closed-form NTK KV order-debias
 score. See [`docs/isr_kv_verifier.md`](docs/isr_kv_verifier.md).
