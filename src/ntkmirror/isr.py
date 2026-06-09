@@ -150,6 +150,75 @@ class HFChoiceVerifierBackend:
         p = torch.softmax(logps, dim=-1)[0]
         return _validate_probability(float(p.item()), "p_yes")
 
+    @torch.no_grad()
+    def p_yes_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        query: str = SUPPORT_QUERY,
+        choices: Sequence[str] = YESNO,
+        batch_size: int | None = None,
+    ) -> list[float]:
+        """Fused exact permutation scoring.
+
+        Scores every (text, choice) branch in batched forwards instead of one
+        ``model()`` call per branch. For a causal LM with right padding and an
+        attention mask, the real-position logits are identical to the unpadded
+        single-sequence forward, so the returned probabilities match looping
+        :meth:`p_yes` to floating-point tolerance (bit-identical on CPU).
+        """
+        choices = _validate_choices(choices)
+        texts = [str(t) for t in texts]
+        if not texts:
+            return []
+        choice_ids_list: list[list[int]] = []
+        for choice in choices:
+            cids = self._encode(choice)
+            if not cids:
+                raise ValueError(f"choice {choice!r} tokenized to zero tokens")
+            choice_ids_list.append(cids)
+        seqs: list[tuple[int, int, int, int, list[int]]] = []
+        for ti, text in enumerate(texts):
+            prompt_ids = self._encode(str(text) + str(query))
+            if not prompt_ids:
+                raise ValueError("verifier prompt tokenized to zero tokens")
+            for ci, cids in enumerate(choice_ids_list):
+                seqs.append((ti, ci, len(prompt_ids), len(cids), prompt_ids + cids))
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None) or 0
+        n = len(seqs)
+        bs = int(batch_size) if batch_size else n
+        if bs <= 0:
+            raise ValueError("batch_size must be positive")
+        logps: list[list[Any]] = [[None] * len(choices) for _ in texts]
+        for b0 in range(0, n, bs):
+            batch = seqs[b0 : b0 + bs]
+            maxlen = max(len(srow[4]) for srow in batch)
+            ids = torch.full((len(batch), maxlen), int(pad_id), dtype=torch.long, device=self.device)
+            mask = torch.zeros((len(batch), maxlen), dtype=torch.long, device=self.device)
+            for r, (_, _, _, _, srow) in enumerate(batch):
+                ids[r, : len(srow)] = torch.tensor(srow, dtype=torch.long, device=self.device)
+                mask[r, : len(srow)] = 1
+            logits = self.model(ids, attention_mask=mask).logits
+            if logits.ndim != 3:
+                raise ValueError("model returned logits with an unexpected shape")
+            for r, (ti, ci, plen, clen, _) in enumerate(batch):
+                start = plen - 1
+                stop = plen + clen - 1
+                lp = logits[r, start:stop, :].float().log_softmax(dim=-1)
+                target = torch.tensor(choice_ids_list[ci], dtype=torch.long, device=lp.device)
+                val = lp.gather(1, target.view(-1, 1)).sum()
+                if self.length_normalize_choices:
+                    val = val / max(1, clen)
+                logps[ti][ci] = val.detach().cpu()
+        out: list[float] = []
+        for ti in range(len(texts)):
+            lp = torch.stack(logps[ti], dim=0).double()
+            p = torch.softmax(lp, dim=-1)[0]
+            out.append(_validate_probability(float(p.item()), "p_yes"))
+        return out
+
 
 class KVDeltaBayesNTKBackendAdapter:
     """Adapter for the legacy ``kv_delta_bayes_ntk`` backend used by the prototype.
@@ -680,10 +749,11 @@ def score_claim(
     dispersion_penalty = _finite_float(dispersion_penalty, "dispersion_penalty")
     rng = np.random.default_rng(int(seed) * 100003 + int(row_index))
     orderings = make_orderings(len(example.spans), num_orderings, rng)
-    qs: list[float] = []
-    for order in orderings:
-        text = verbalize([example.spans[j] for j in order], example.claim)
-        qs.append(_call_p_yes(backend, text, query=query, choices=choices))
+    texts = [verbalize([example.spans[j] for j in order], example.claim) for order in orderings]
+    if hasattr(backend, "p_yes_batch"):
+        qs = [float(q) for q in backend.p_yes_batch(texts, query=query, choices=choices)]
+    else:
+        qs = [_call_p_yes(backend, text, query=query, choices=choices) for text in texts]
     q_arr = np.asarray(qs, dtype=float)
     if not np.isfinite(q_arr).all():
         raise ValueError("one or more ISR ordering scores is non-finite")
