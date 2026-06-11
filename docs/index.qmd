@@ -1,0 +1,56 @@
+---
+title: "NTK-Mirror"
+subtitle: "LoRA-free forward-pass fine-tuning for frozen causal language models"
+---
+
+`ntkmirror` adapts frozen Hugging Face causal LMs **without any weight
+updates**. It learns a sparse *signed log-gate controller* — a few thousand
+scalar gates that multiplicatively rescale selected decoder-layer channels:
+
+$$
+h'_{\ell,t,c} = e^{\,s_{\ell,c}}\, h_{\ell,t,c},
+\qquad |s_{\ell,c}| \le s_{\max}.
+$$
+
+The controller is a small, detachable artifact: it can be trained in
+minutes, saved to a file, composed with other controllers in log-gate
+space, stored in a retrievable persistent memory, and attached per-request
+at serving time — all while the base model stays untouched.
+
+## Start here
+
+- **[Technical report](ntkmirror_technical_report.qmd)** — a full
+  reverse-engineering of the scientific method behind the repository: the
+  controller mechanism, the activation-control NTK dual diagnostics,
+  composition, persistent memory, the ISR hallucination verifier, the
+  serving runtime, and the benchmark protocol, organized as a ledger of
+  falsifiable hypotheses and the instruments that can refute them.
+
+## Method notes
+
+The original design notes that ship with the package:
+
+| Note | Topic |
+|---|---|
+| [Method note](method.md) | The deployable controller and its failure modes |
+| [Activation-control NTK duality](activation_control_ntk.md) | When gate updates can realize full-weight SGD fields |
+| [Controller composability](composability.md) | Adding controllers in signed log-gate space |
+| [Persistent memory controllers](persistent_memory.md) | Controllers as retrievable behavioral memories |
+| [Persistent memory benchmark](public_memory_benchmark.md) | The five-condition benchmark protocol and its controls |
+| [ISR verifier & KV order-debias](isr_kv_verifier.md) | Order-sensitivity as a hallucination signal |
+| [V2 operating layer](v2_operating_layer.md) | Runtime isolation, artifact admission, memory governance |
+| [Diffusion Adam-M scale gate](diffusion_scale_gate_adam_m.md) | A separate research harness and its failure analysis |
+
+## Install and use
+
+```bash
+git clone https://github.com/dhavala-iitjmu/ntkmirror.git
+cd ntkmirror
+pip install -e .
+
+ntkmirror fit --model Qwen/Qwen2.5-0.5B-Instruct --train train.jsonl --out controller.pt
+ntkmirror eval --model Qwen/Qwen2.5-0.5B-Instruct --controller controller.pt --eval eval.jsonl
+```
+
+See the [README](https://github.com/dhavala-iitjmu/ntkmirror#readme) for
+the full CLI reference and data formats.

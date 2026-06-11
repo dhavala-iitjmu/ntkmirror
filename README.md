@@ -4,6 +4,10 @@
 
 LoRA-free forward-pass fine-tuning for Hugging Face causal language models.
 
+**Documentation:** <https://dhavala-iitjmu.github.io/ntkmirror/> — including a
+[technical report](https://dhavala-iitjmu.github.io/ntkmirror/ntkmirror_technical_report.html)
+that reverse-engineers the scientific method behind the package.
+
 `ntkmirror` learns a small signed controller on top of a frozen Transformer. It
 adds no LoRA modules and makes no permanent weight edits. The controller is a
 sparse set of shared log-gates on decoder-layer output channels:

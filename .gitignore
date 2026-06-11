@@ -22,3 +22,7 @@ env/
 runs/
 logs/
 *.pt
+
+# Quarto site build
+/docs/_site/
+/docs/.quarto/

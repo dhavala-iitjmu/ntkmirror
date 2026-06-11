@@ -1,0 +1,965 @@
+---
+title: "NTK-Mirror: Forward-Pass Behavioral Control of Frozen Language Models"
+subtitle: "A reverse-engineered technical report on the scientific method behind `ntkmirror` v0.4.0"
+author: "Technical report prepared from source-code analysis of the `ntkmirror` repository (Hassana Labs / Leon Chlon)"
+date: 2026-06-11
+abstract: |
+  `ntkmirror` adapts frozen Hugging Face causal language models without
+  changing a single weight. Its deployable object is a sparse *signed
+  log-gate controller*: a few thousand scalar gates that multiplicatively
+  rescale selected decoder-layer channels, $h' = e^{s} h$ with
+  $|s| \le s_{\max}$. Around this mechanism the repository builds a complete
+  research program: a falsifiable theory of when gate updates can imitate
+  full-weight SGD steps (the activation-control NTK dual), an algebra for
+  composing controllers in log-gate space, a versioned persistent memory of
+  controllers with retrieval, an order-sensitivity hallucination verifier
+  (ISR), a serving runtime with admission policies, and a benchmark protocol
+  whose controls are designed to refute its own headline claims. This report
+  reverse-engineers that scientific method from the code and documentation.
+  It describes what the system measures and how each claim can fail; the
+  repository ships methodology and invariant tests, not committed empirical
+  results, and this report quotes no numbers that the code does not define.
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    html-math-method: mathjax
+    code-overflow: wrap
+execute:
+  enabled: false
+---
+
+# Executive summary
+
+`ntkmirror` (v0.4.0, Python ≥ 3.10, `torch` ≥ 2.3, `transformers` ≥ 4.43)
+is a LoRA-free fine-tuning package with an unusual property: **the base model
+is never modified**. There are no adapter modules, no merged weights, and no
+permanent edits. Adaptation lives entirely in a sparse set of scalar gates
+attached by removable PyTorch forward hooks:
+
+$$
+h'_{\ell,t,c} \;=\; e^{\,s_{\ell,c}}\, h_{\ell,t,c},
+\qquad |s_{\ell,c}| \le s_{\max},
+$$
+
+where $\ell$ indexes a decoder layer, $c$ a residual-stream channel, $t$ a
+token position, and $s_{\max}$ (`max_log_gate`, default $0.05$) bounds every
+gate. A controller is therefore a small, serializable, *detachable* artifact
+— closer to a configuration than to a checkpoint.
+
+That one design decision generates the entire system. Because the
+intervention is multiplicative in activation space, it is **additive in
+log-gate space**, so controllers compose by weighted addition
+(@sec-composition). Because controllers are small files bound to a model
+revision, they can be stored, versioned, retrieved, and composed on demand
+as a **persistent behavioral memory** (@sec-memory). Because gates form a
+low-dimensional control basis on a frozen network, one can ask a sharp
+theoretical question — *can a gate update realize the same projected-logit
+displacement as a full-weight SGD step?* — and answer it with a measurable
+residual rather than an assumption (@sec-dual). And because attachment is
+request-scoped and reversible, serving reduces to hook hygiene plus artifact
+admission (@sec-runtime).
+
+The subsystem inventory:
+
+| Subsystem | Module(s) | Purpose |
+|---|---|---|
+| Signed log-gate controller | `controller.py`, `layers.py`, `losses.py`, `data.py` | Select, train, save, load, attach sparse gates |
+| NTK dual diagnostics | `dual.py` | Test whether full-weight SGD fields lie in the gate tangent range |
+| Composition algebra | `compose.py` | Add controllers in log-gate space; pre-flight interference checks |
+| Persistent memory | `memory.py`, `retrieval.py` | Versioned controller store with lexical/embedding/hybrid retrieval |
+| ISR hallucination verifier | `isr.py` | Order-sensitivity score for evidence-support verification |
+| Runtime & governance | `runtime.py`, `artifacts.py` | Request-scoped application, admission policy, lint/card/doctor |
+| CLI | `cli.py` | One command per instrument (`fit`, `secant`, `dual-diagnose`, `isr-auc`, …) |
+| Benchmark protocol | `scripts/benchmark_persistent_memory_suite.py` | Memory benchmark with built-in refutation controls |
+
+The thesis of this report is that the repository is best read not as a
+feature list but as a **sequence of falsifiable claims, each paired with an
+instrument that can refute it**. Each of the core methodology documents in
+`docs/` carries a section titled "Failure modes …" or "Failure hypotheses
+…";
+every headline mechanism ships with a diagnostic command whose output can
+contradict the mechanism's advertised story; and the test suite encodes the
+refutation thresholds as standing CI assertions. @sec-method reconstructs
+this structure explicitly as a hypothesis ledger.
+
+::: {.callout-important}
+## What this report does *not* contain
+
+The repository ships methodology, instruments, and invariant tests — **no
+committed empirical results**. Accordingly, this report describes what the
+system measures and how each measurement can fail. It does not report
+accuracies, AUROCs, or speedups, because none are recorded in the source
+tree. Where the documentation cites observed behavior (e.g., the diffusion
+appendix's gate-collapse statistics), that provenance is flagged explicitly.
+:::
+
+# System overview and architecture {#sec-overview}
+
+## Design constraints
+
+Three constraints, stated or implied throughout the code, shape every
+component:
+
+1. **Frozen weights.** `ForwardFineTuner.__init__` calls
+   `_freeze(model)` immediately; the only `nn.Parameter` the package ever
+   creates is the gate vector `raw`. A dedicated test
+   (`test_controller_does_not_register_base_layers_as_children`) asserts the
+   controller module exposes exactly one parameter — the decoder layers are
+   held as non-owned references precisely so `state_dict()` cannot
+   accidentally swallow the base model.
+2. **Hot-swappable behavior.** Hooks attach and detach in context managers
+   with `finally` blocks; the same model instance can serve base behavior
+   and many controllers in interleaved requests.
+3. **Auditability.** Every artifact records the model/tokenizer name *and
+   revision* it was trained against; loaders refuse mismatched identities by
+   default; stores are plain JSON plus `.pt` tensors loadable with
+   `weights_only=True` (no pickle execution).
+
+## Component map
+
+```text
+                          ┌────────────────────────────────────────────┐
+                          │           frozen HF causal LM              │
+                          │  decoder layers (model.layers, ...)        │
+                          └────────┬───────────────────────▲───────────┘
+                 forward hooks     │                       │ attach/remove
+                                   ▼                       │
+   ┌──────────────┐   fit    ┌──────────────────┐  apply  ┌┴──────────────────┐
+   │ JSONL data   ├─────────►│ SignedLogMask    │◄────────┤ ControllerRuntime │
+   │ (data.py)    │          │ controller       │         │ + RuntimePolicy   │
+   └──────────────┘          │ (controller.py)  │         │ (runtime.py)      │
+                             └───┬──────────┬───┘         └───────▲───────────┘
+                  save/load .pt  │          │ s-vector            │ admission
+                                 ▼          ▼                     │
+                       ┌──────────────┐  ┌──────────────┐  ┌──────┴────────┐
+                       │ compose.py   │  │ dual.py      │  │ artifacts.py  │
+                       │ s_AB = Σwᵢsᵢ │  │ secant/range │  │ lint/card/    │
+                       └──────┬───────┘  │ diagnostics  │  │ doctor        │
+                              │          └──────────────┘  └───────────────┘
+                              ▼
+                       ┌──────────────────────────┐   ┌──────────────────┐
+                       │ memory.py / retrieval.py │   │ isr.py           │
+                       │ store + search + compose │   │ q_marg, ISR,     │
+                       └──────────────────────────┘   │ KV order-debias  │
+                                                      └──────────────────┘
+```
+
+## Three data flows
+
+**Train.** `load_jsonl_examples` parses prompt/completion (or
+instruction/response, question/answer, text, or chat-`messages`) rows;
+prompt tokens are masked with label `-100`, completions are teacher-forced
+(`data.py`). `ForwardFineTuner.fit` first *selects* gates by saliency on up
+to `score_batches` (default 16) batches, then runs AdamW (default 240 steps,
+lr $5\times10^{-3}$) on the single `raw` parameter, with optional
+validation-based early stopping, retain-set loss, and KL-to-base
+regularization. `save()` writes a `SignedLogMaskState` dict with schema
+version, gate indices, and full model/tokenizer identity.
+
+**Serve.** `ControllerRuntime.apply(...)` validates a state against the live
+model (layer path, layer count, hidden size, identity), builds a transient
+hook module, attaches it under a lock, yields, and removes hooks in
+`finally`. Composition happens at request time from one or more artifacts;
+heterogeneous per-row controllers in one batch are rejected rather than
+silently mis-served.
+
+**Research.** `secant`, `dual-diagnose`, and `fit-dual` treat the gates as
+an activation-control basis and interrogate its geometry against full-weight
+SGD fields (@sec-dual); `isr-auc` runs the verifier study (@sec-isr); the
+benchmark suite trains one memory per task and evaluates the five-condition
+design matrix (@sec-benchmark).
+
+## The prime invariant (H0)
+
+Everything rests on the claim that **the base model is never modified**.
+The repo treats this not as an assumption but as a standing, tested
+invariant: the controller holds layers as non-owned references; the dual
+target's finite-difference weight step is applied and then *reversed inside
+a `finally`-guarded block* (`full_weight_sgd_field_finite_difference`
+re-adds the gradient step even on exception); `evaluate_nll(...,
+use_controller=False)` temporarily detaches and then restores an outer
+controller; and runtime hooks are removed even when generation raises
+(`test_runtime_apply_removes_hooks_after_exception`).
+
+# The scientific method, reconstructed {#sec-method}
+
+Reading `docs/` and the test suite together, the repository's working style
+follows one repeated template:
+
+> **Hypothesis** (a mechanism should work) → **Instrumentation** (a command
+> that measures it) → **Diagnostics** (named quantities with thresholds) →
+> **Failure modes** (documented ways the measurement can mislead).
+
+The documentation is unusually explicit about the last step: `docs/method.md`
+has "Failure modes to check before believing a result";
+`docs/activation_control_ntk.md` has "Failure modes to check";
+`docs/composability.md` has "Failure hypotheses";
+`docs/persistent_memory.md` has "Failure hypotheses to test";
+`docs/public_memory_benchmark.md` has "Failure modes directly tested". These
+are not disclaimers — each names the *instrument* that would detect the
+failure.
+
+## Hypothesis ledger
+
+| # | Hypothesis | Instrument | Refutation signal | Location |
+|---|---|---|---|---|
+| H0 | The base model is never modified; all interventions are reversible | parameter registration, `finally`-guarded hook removal & FD-step reversal | base outputs change after detach; extra parameters appear | `controller.py`, `dual.py`, `tests/test_controller.py`, `tests/test_runtime.py` |
+| H1 | A sparse multiplicative log-gate on decoder channels can lower task NLL | `ntkmirror fit` + `eval` | no NLL/token-accuracy gain vs. base across a `--gates` sweep | `controller.py`, `cli.py` |
+| H2 | Gates chosen by $\lvert\partial L/\partial s\rvert$ at $s=0$ are the useful ones | `_score_gates` saliency; random-gate control prescribed in README | random gates match scored gates | `controller.py`, README "Notes for benchmark claims" |
+| H3 | The trained controller is explained by its initial tangent | `ntkmirror secant` | high `secant_err` at $\alpha=1$ | `dual.py` |
+| H4 | The full-weight SGD projected-logit field lies in the gate-tangent range | `ntkmirror dual-diagnose` | high `range_residual` with clean `adjoint_error`/`symmetry_error`/CG | `dual.py`, `docs/activation_control_ntk.md` |
+| H5 | Controllers compose additively in log-gate space | `compose`, `compose-plan`, `inspect` | saturation, opposing-sign overlap, negative transfer on held-out evals | `compose.py`, `docs/composability.md` |
+| H6 | Controllers work as retrievable persistent memories | memory store + retriever + benchmark suite | low retrieval recall; wrong-memory harm; leakage | `memory.py`, `retrieval.py`, benchmark CSVs |
+| H7 | Order-sensitivity of a verifier flags unsupported claims | `ntkmirror isr-auc` | AUROC ≈ 0.5; ISR worse than `q_marg`; confident-wrong verifier | `isr.py`, `docs/isr_kv_verifier.md` |
+| H8 | Serving is safe under admission + isolation | `RuntimePolicy`, `lint`, `card`, `doctor` | identity-mismatch acceptance; hook leakage; cross-request contamination | `runtime.py`, `artifacts.py` |
+
+Two methodological refinements recur often enough to call out:
+
+- **Confusable failures get orthogonal instruments.** A bad composed
+  controller could be a retrieval error, gate collision, saturation, or
+  prompt mismatch; the benchmark emits a separate CSV for each. A high dual
+  residual could be a solver bug, a too-large step, or a genuine range
+  failure; `dual.py` separates `adjoint_error`, `symmetry_error`, CG
+  convergence, `range_residual`, and `realized_residual` so the error
+  *ordering* identifies the culprit (@sec-dual-taxonomy).
+- **Certificates are replaced by measurements.** The docs explicitly retire
+  gate-norm and clip-fraction as duality certificates ("The controller is
+  not certified by being small in its own gate chart") in favor of the
+  measured range residual, and retire the v1 secant statement
+  ($Pz(s)-Pz(0)\approx B(0)s$) as "only a secant diagnostic".
+
+# Core mechanism: the signed log-gate controller {#sec-controller}
+
+**Hypothesis under test (H1, H2):** a sparse multiplicative rescaling of
+decoder-layer channels, selected by first-order saliency, is enough to adapt
+a frozen model's behavior on teacher-forced data.
+
+## Intervention and parameterization
+
+Each gate $j$ addresses one (layer $\ell_j$, channel $c_j$) pair. The
+trainable parameter is an unconstrained vector $r \in \mathbb{R}^{k}$; the
+applied signed log-gate is the bounded reparameterization
+
+$$
+s_j \;=\; s_{\max}\,\tanh(r_j), \qquad
+h'_{\ell_j,t,c_j} = e^{s_j}\, h_{\ell_j,t,c_j}.
+$$
+
+The $\tanh$ box keeps every gate in $(-s_{\max}, s_{\max})$ *by
+construction*, so no projection step is needed during optimization; with the
+default $s_{\max}=0.05$, each channel's scale stays within
+$e^{\pm 0.05} \approx [0.951, 1.051]$. Hooks implement the rescaling at one
+of two sites: `layer_output` (default; post-hook on each decoder layer's
+output) or `layer_input` (pre-hook on the layer's first positional input).
+For exact round-tripping of stored values, the inverse map
+$r = \operatorname{atanh}(s/s_{\max})$ is applied with clamping to
+$\pm 0.999999$.
+
+## Gate selection by first-order saliency
+
+For a multiplicative gate at $s=0$, the chain rule gives the per-channel
+loss sensitivity directly from quantities available in one backward pass:
+
+$$
+\frac{\partial L}{\partial s_{\ell,c}}\bigg|_{s=0}
+= \sum_{t} \frac{\partial L}{\partial h_{\ell,t,c}}\; h_{\ell,t,c}.
+$$
+
+`_score_gates` captures decoder-layer activations with `retain_grad()`,
+backpropagates the standard causal cross-entropy, and accumulates a
+per-channel score over up to `score_batches` batches. The top
+`gates` (default 5000) layer–channel pairs by score become the controller
+support; their gate values start at $s=0$ (identity behavior).
+
+::: {.callout-note}
+## Code vs. docs nuance: $\sum_t \lvert g_t h_t \rvert$, not $\lvert \sum_t g_t h_t \rvert$
+
+`docs/method.md` writes the selection score as the magnitude of the summed
+derivative. The implementation
+(`(h.grad * h).abs().sum(dim=(0, 1))` in `controller.py`) sums the
+*absolute* per-position contributions over batch and sequence — an upper
+bound on the docs' quantity. The implemented variant cannot miss a channel
+whose positive and negative token contributions cancel; it is a deliberate
+(or at least more conservative) saliency choice, and worth knowing when
+reproducing the selection.
+:::
+
+## Training objective
+
+With the controller attached, `fit` minimizes
+
+$$
+L \;=\; L_{\text{task}}
+\;+\; \lambda_{\text{retain}}\, L_{\text{retain}}
+\;+\; \lambda_{\text{KL}}\, \mathrm{KL}\!\left(P_{\text{base}} \,\Vert\, P_{\text{ctrl}}\right)
+\;+\; \lambda_{2}\, \overline{s^{2}},
+$$
+
+where $L_{\text{task}}$ and $L_{\text{retain}}$ are mean next-token
+cross-entropies over supervised positions (labels $\neq -100$), the KL term
+is averaged over supervised retain-row positions with base logits computed
+with the controller *temporarily removed*, and $\overline{s^2}$ is the mean
+squared signed gate. Both regularizers require an explicit retain set
+(`--retain`); the optimizer is AdamW on `raw` only. Validation rows trigger
+periodic NLL evaluation, early stopping after `early_stop_patience` stale
+checks, and best-checkpoint selection on validation NLL.
+
+## Defaults and artifact schema
+
+| Hyperparameter | Default | Role |
+|---|---:|---|
+| `gates` | 5000 | controller capacity (top-k saliency) |
+| `layers` | `all` | candidate decoder layers (`all`, `last`, `last:N`, indices) |
+| `max_log_gate` ($s_{\max}$) | 0.05 | per-gate box bound |
+| `hook_site` | `layer_output` | intervention site |
+| `steps` | 240 | AdamW steps |
+| `lr` | $5\times 10^{-3}$ | gate learning rate |
+| `batch_size` / `score_batches` | 8 / 16 | training / selection batches |
+| `l2` ($\lambda_2$) | $10^{-5}$ | mean-$s^2$ penalty |
+| `retain_weight`, `kl_to_base` | 0 / 0 | opt-in retention objectives |
+
+The saved artifact (`SignedLogMaskState`, schema version 2) stores
+`layer_path`, `n_layers`, `hidden_size`, rank-1 tensors `layer_indices` /
+`channel_indices` / `raw`, `max_log_gate`, `hook_site`,
+`theory_version="activation_control"`, the model/tokenizer **names and
+revisions**, a creation timestamp, and free-form metadata. Validation
+rejects duplicate gate keys, out-of-range indices, non-finite values, and
+unknown schema versions; loading uses `torch.load(...,
+weights_only=True)` so a controller file cannot execute pickle payloads, and
+the legacy pickle path is an explicit `unsafe_legacy_load=True` opt-in.
+
+**Refutation surface.** `docs/method.md` lists the ways a positive result
+here can mislead: evaluation contaminated by problems the base model already
+solves; capacity confounds (a 512-gate and a 10k-gate controller are
+different objects — sweep `--gates`); NLL improving while exact-answer
+accuracy does not; over-large `--max-log-gate` hurting generation; and
+non-standard decoder stacks needing a layer-path extension. The README's
+benchmark notes additionally demand a random-gate control — the direct
+refutation of H2.
+
+# NTK dual: can gates imitate weight updates? {#sec-dual}
+
+**Hypothesis under test (H3, H4):** this is the intellectual core of the
+repository. The question is not whether gates *help*, but whether the gate
+basis is *dual* to full-weight SGD — whether the projected-logit
+displacement that a real (infinitesimal) weight step would produce lies in
+the range of the gate tangent.
+
+## The target field: measured, not assumed
+
+For support loss gradient $g_S$ and learning rate $\eta$, NTK theory says a
+full-weight SGD step displaces calibration logits (to first order) by
+
+$$
+d_C^{\theta} \;=\; -\eta\, J_{\theta,C}\, J_{\theta,S}^{\top}\, g_S,
+$$
+
+where $J_{\theta,C}$ and $J_{\theta,S}$ are Jacobians of calibration
+projections and support loss with respect to weights. The implementation
+refuses to trust this formula symbolically. Instead,
+`full_weight_sgd_field_finite_difference` *performs the step*: it computes
+the support gradient, applies $\theta \leftarrow \theta - \eta\, g$ in place
+(default $\eta = 10^{-5}$, `--target-step-size`), re-evaluates the projected
+calibration field, **reverses the step**, and returns the measured
+displacement $d = F_C(\theta - \eta g) - F_C(\theta)$. The reversal is
+`finally`-guarded so an exception cannot leave the model perturbed (H0).
+Cost control comes from `--param-filter` (substring selection, e.g.
+`q_proj,k_proj,v_proj,o_proj`) and `--max-target-parameters` (a hard guard
+before differentiating the whole model).
+
+## Projected-logit coordinates
+
+All fields live in a fixed projection of supervised next-token logits,
+built once from a baseline forward pass (`build_logit_projection`):
+
+- `target` (alias `gold`): one teacher-forced coordinate per supervised
+  token — cheap, but only tests the teacher-token event direction;
+- `topk` (alias `gold_topk`): the teacher token plus the top-`k` (default
+  32) *non-teacher* baseline tokens per position. The v1 implementation
+  duplicated the gold token inside the event set, silently overweighting it;
+  v2 explicitly excludes it from the top-k before concatenation (a recorded,
+  fixed instrumentation bug — see `test_topk_projection_does_not_duplicate_gold_token`);
+- `full`: all vocabulary coordinates, exact but `n_positions × vocab` large,
+  guarded by `max_dim`.
+
+Logits are centered across the vocabulary before gathering (and the `topk`
+event set is re-centered internally), so the coordinates measure
+distribution shape rather than a constant logit offset.
+
+## The matrix-free, adjoint-consistent solve
+
+At controller state $s_t$, the gate tangent is
+$B_C(s_t) = \partial\, (P_C\, z(s_t)) / \partial s$. The duality question is
+answered by ridge-projecting the measured target onto
+$\operatorname{range}(B)$:
+
+$$
+\left(B M^{-1} B^{\top} + \lambda I\right)\alpha = d,
+\qquad
+u = M^{-1} B^{\top} \alpha,
+$$
+
+solved by conjugate gradients (defaults: `ridge` $\lambda = 10^{-4}$,
+`cg_iters` 16, `cg_tol` $10^{-5}$). Nothing materializes $B$: $Bv$ is an
+exact autograd JVP, $B^{\top}y$ an exact autograd VJP through
+`temporary_signed_log_values` (a differentiable override of the applied
+gates). Because both directions come from the same autograd graph, the CG
+operator $K = BM^{-1}B^\top + \lambda I$ is symmetric positive-definite up
+to floating-point error — *and the code verifies this instead of assuming
+it*, with random-probe checks
+$\langle Bv, y\rangle \overset{?}{=} \langle v, B^{\top}y\rangle$
+(`adjoint_error`) and $a^{\top}Kb \overset{?}{=} b^{\top}Ka$
+(`symmetry_error`). A finite-difference JVP (`--jvp-mode fd`) is retained
+*only* as an ablation; the docs state plainly that mixing FD forward with
+autograd adjoint makes $K$ non-adjoint, so its residuals "are not
+reachability evidence."
+
+The metric $M$ is `identity` (an ablation, per the docs) or `activation`: a
+diagonal metric $M_j \approx \mathbb{E}[h_j^2]\, e^{2 s_j}$ estimated on the
+calibration batch, so that gate displacement is measured in units of induced
+activation displacement. By default the implementation records activations
+with the controller attached (`record_current_state=True`), which folds the
+$e^{2s_j}$ factor in empirically and lets upstream gates influence
+downstream metrics; the closed-form $e^{2s_j}$ correction is the documented
+approximation recovered with `record_current_state=False`.
+
+## Residual taxonomy {#sec-dual-taxonomy}
+
+The solver refuses to compress the answer into one number. It reports:
+
+| Diagnostic | Definition | What a high value means |
+|---|---|---|
+| `adjoint_error` | probe gap $\langle Bv,y\rangle$ vs $\langle v,B^\top y\rangle$ | JVP/VJP inconsistent → solver invalid, residuals meaningless |
+| `symmetry_error` | probe gap $a^\top K b$ vs $b^\top K a$ | CG operator not symmetric → same |
+| `cg.converged`, `residual_history` | CG convergence record | under-solve; raise `--cg-iters` before interpreting |
+| `range_residual` | $\lVert d - Bu\rVert / \lVert d\rVert$ | target field not in local gate-tangent range (**the duality verdict**) |
+| `realized_residual` | $\lVert d - (F(s+u)-F(s))\rVert / \lVert d\rVert$ | linear range fine but step too large / chart too curved |
+| `clipped_realized_residual` | same, after box-clipping $s+u$ | what the *deployable* clipped update actually realizes |
+| `field_residual` | alias of `clipped_realized_residual` | safety-facing name for the same number |
+| `box_clip_fraction`, `box_active_fraction`, `box_clip_update_residual` | how much of $u$ the box constraint changed | solved step ≠ applied step; read clipped numbers |
+| `secant_err`, `cos_local_initial` (from `secant`) | trained-controller departure from initial tangent | H3 fails — but see below |
+
+The test suite pins the clean-instrument regime numerically: on a toy model
+with near-exact solves, `adjoint_error` $< 10^{-5}$, `symmetry_error`
+$< 10^{-5}$, `range_residual` $< 10^{-4}$, `realized_residual`
+$< 5\times10^{-3}$ (`tests/test_dual.py`), and a dedicated test constructs a
+box-clipped scenario to assert `clipped_realized_residual ≥
+realized_residual` with non-zero clip fractions.
+
+## The error-ordering decision tree
+
+The taxonomy supports a diagnosis procedure that the docs spell out as
+failure modes; flattened into a decision tree:
+
+```text
+adjoint_error or symmetry_error high?
+└─ yes → solver invalid (FD/VJP mix? bug?). Fix before reading residuals.
+└─ no → CG unconverged?
+    └─ yes → raise --cg-iters; an under-solve mimics range failure.
+    └─ no → range_residual high?
+        └─ yes → genuine range failure: full-weight field is NOT in the
+                 selected gate tangent on this projection. (Check the
+                 projection isn't too narrow: target may pass while
+                 topk/full fail.)
+        └─ no → realized_residual high?
+            └─ yes → realization failure: step too large or chart too
+                     curved (sweep --target-step-size).
+            └─ no → box_clip_fraction high?
+                └─ yes → interpret clipped_realized_residual, not
+                         realized_residual: the applied step was clipped.
+                └─ no → local duality holds on this projection.
+```
+
+One distinction deserves emphasis because the docs repeat it three times:
+**initial-tangent failure is not dual failure.** A finite trained controller
+can leave the secant approximation from $s=0$ (high `secant_err` at
+$\alpha=1$) while every *local* field solve along the path succeeds. The
+`secant` command exists to diagnose the v1 linearization story, not to
+certify duality; `dual-diagnose` is the range test; and `fit-dual` is the
+constructive version — a pathwise optimizer that, at each step (the Python
+API defaults to 8 steps; the CLI inherits the shared `--steps` flag, default
+240), re-measures the local full-weight target field and applies the
+best-realizing gate update (reporting per-step `clip_fraction` and
+`clip_update_residual` where the box constraint bit).
+
+**Refutation surface.** Beyond the decision tree: too-large $\eta$ measures
+a nonlinear weight move, too-small drowns in numerical noise (sweep it);
+`target` projection can flatter the controller while `topk`/`full` refute
+it; on 7B-scale models the full-weight target is expensive, so scoped
+`--param-filter` runs come first; and `layer_output` vs `layer_input`
+hook-site ablations are prescribed for theorem-facing claims.
+
+# Composition: an algebra of skills {#sec-composition}
+
+**Hypothesis under test (H5):** because channel scales multiply in
+activation space, addition in signed log-gate space is the natural
+composition rule for controllers, and disjoint task controllers should
+compose without destructive interference.
+
+## The rule and its preconditions
+
+$$
+s_{AB} \;=\; \operatorname{clip}\!\Big(\textstyle\sum_i w_i\, s^{(i)},\;
+-s_{\max},\, +s_{\max}\Big),
+\qquad h' = e^{s_{AB}} h .
+$$
+
+`compose_states` materializes each input as a sparse
+$(\ell, c) \mapsto s$ map, takes the weighted sum over the union support,
+clips into the (largest input, unless overridden) gate box, and re-encodes
+through $\operatorname{atanh}$. Composition is *refused*, not fudged, when
+inputs disagree on `hidden_size`, `n_layers`, `layer_path`, `hook_site`, or
+`theory_version`; optional identity fields (model/tokenizer name and
+revision) must agree on an all-or-none basis — a state with a known
+identity cannot be composed with one whose identity is missing
+(`_common_optional_identity`). The output records its provenance
+(`composition` metadata: input count, weights, gate counts).
+
+## Interference instrumentation
+
+`pair_report` quantifies geometric compatibility for every controller pair:
+exact gate overlap and union (Jaccard), the fraction of shared gates with
+*opposing signs*, dense gate-vector L2 norms, dot product, and cosine.
+`composition_plan` turns these into a conservative pre-flight check with
+three warning codes and explicit thresholds:
+
+| Warning | Trigger (default) | Mechanical risk |
+|---|---|---|
+| `composition-clips` | > 2% of composed gates exceed $s_{\max}$ pre-clip | saturation: the sum is not what gets applied |
+| `opposing-overlap` | > 50% of shared gates have opposite signs | gate collision: tasks fight over channels |
+| `negative-gate-cosine` | pairwise cosine < −0.1 | globally antagonistic directions |
+
+The docs are careful about epistemic status: these are "mechanical risk
+signals only; they do not prove behavioral compatibility." The final test
+is always behavioral — the composed controller must retain each task's
+held-out NLL improvement (`scripts/run_disjoint_composition.sh` trains
+GSM8K-style and MBPP-style controllers and evaluates base, task-A, task-B,
+and composed controllers on both eval sets).
+
+**Refutation surface** (`docs/composability.md`): negative transfer (fix
+with asymmetric weights or smaller $s_{\max}$); gate collision (high
+overlap + negative cosine); saturation (lower weights or raise gate count —
+notably *not* "raise the clip budget"); under-capacity (sweep gates before
+interpreting composition); prompt/data format mismatch masquerading as
+composition failure (evaluate each controller on both tasks to separate
+them); and NLL improving while exact-answer accuracy does not.
+
+# Persistent memory and retrieval {#sec-memory}
+
+**Hypothesis under test (H6):** a controller is small and composable enough
+to serve as a *persistent behavioral memory item* — fit one per document,
+preference, or skill; store it; retrieve and compose at inference time —
+trading prompt tokens for gate state.
+
+## Store mechanics
+
+`ControllerMemoryStore` is deliberately a local, auditable JSON-plus-files
+store:
+
+```text
+root/index.json                                  (atomic os.replace writes)
+root/controllers/<namespace>/<id>.v<version>.pt  (immutable per version)
+```
+
+Lifecycle semantics live in the index rows (`MemoryItem`): namespaces,
+monotonically increasing versions (an overwrite *retires* the active row
+with `retired_by_version` rather than deleting it), soft delete
+(`deleted_at` timestamps, excluded from search), rollback (copies an old
+version forward as a *new* version, preserving history), and hard delete.
+`audit` checks the whole store: duplicate active ids, missing or unloadable
+controller files, orphan `.pt` files, and mixed model/tokenizer identities
+within one store. Two security properties are enforced at read time: every
+controller path must stay under `controllers/` inside the store root
+(path-traversal rejection, tested by
+`test_memory_index_rejects_path_traversal`), and every artifact must parse
+as a valid `SignedLogMaskState` before it is admitted.
+
+## Retrieval and composition weighting
+
+The store's built-in scorer is a dependency-free TF-IDF cosine over a small
+tokenizer with stop-word filtering; `min_score` defaults to a *positive*
+$10^{-8}$, so zero-overlap memories are never returned and a no-hit query
+falls back to the base model rather than attaching an arbitrary controller
+(an explicit design point in `docs/v2_operating_layer.md`).
+`retrieval.py` adds two stronger retrievers for the benchmark:
+
+- `embedding`: sentence-transformers cosine
+  (default `all-MiniLM-L6-v2`, normalized embeddings);
+- `hybrid` (default in the benchmark): min–max-normalize lexical and
+  embedding scores per query, then mix with
+  $\alpha\,\text{emb} + (1-\alpha)\,\text{lex}$, $\alpha = 0.65$. A
+  documented edge case: when all candidates tie (e.g., a single positive
+  match), normalization preserves the positive signal instead of zeroing it
+  out, which would otherwise spuriously trigger the no-hit fallback.
+
+Retrieved hits are converted to composition weights by softmax over scores
+with temperature $T = 0.25$ (alternatives: `score`-proportional or
+`uniform`), so composing the top-$k$ memories interpolates rather than sums
+uncontrolledly; `compose_for_query` then reuses the @sec-composition
+machinery unchanged.
+
+## Scope discipline
+
+The docs draw a sharp boundary: controller memories are for *behavior* —
+procedures, style, preferences, local terminology — and explicitly **not**
+a replacement for factual retrieval. "If the answer requires a quote or a
+date, put that evidence in the prompt." The controller changes forward
+dynamics; it cannot insert missing strings into context. The same boundary
+appears in the controller card's default limitations text and in the
+README's persistent-memory section ("not as a substitute for factual
+retrieval, source provenance, or RAG").
+
+**Refutation surface** (`docs/persistent_memory.md`): retrieval error
+(inspect `memory search` before blaming the controller); composition
+interference (use `inspect`, reduce `top_k`); saturation; undertrained
+memories that retrieve correctly but inject weak controllers;
+prompt/controller mismatch (facts belong in context); stale or *poisoned*
+memories — a controller is "executable-adjacent model state", so stores
+must stay trusted, versioned, and deletable; and task non-orthogonality.
+
+# ISR: order-sensitivity as a hallucination signal {#sec-isr}
+
+**Hypothesis under test (H7):** a verifier's support probability for a
+*well-supported* claim should be stable under permutations of the evidence
+order; instability is a signal that the verifier is keying on position
+rather than content. Penalizing dispersion should therefore improve
+hallucination detection.
+
+## Scores
+
+Given a claim and evidence spans, the verifier text is a fixed template
+(`verbalize`):
+
+```text
+Evidence:
+- <span A>
+- <span B>
+Claim: <claim>
+Is the claim fully supported by the evidence? Answer YES or NO:
+```
+
+The backend returns $P(\text{YES})$ by softmax over the two choice-sequence
+log-likelihoods (choices `" YES"` / `" NO"`; an opt-in
+`--length-normalize-choices` flag divides every choice's log-likelihood by
+its token count, which the docs recommend when choices tokenize to
+different lengths). With `num_orderings` $= m$ (default 6,
+the first always canonical) and per-ordering probabilities $q_1,\dots,q_m$:
+
+$$
+q_{\text{canon}} = q_1, \qquad
+q_{\text{marg}} = \frac{1}{m}\sum_i q_i, \qquad
+\mathrm{ISR} = q_{\text{marg}} - \beta\,\sigma(q),
+$$
+
+with dispersion penalty $\beta$ (default 1.0) and population standard
+deviation $\sigma$. Permutations are drawn from a deterministic per-row RNG
+(`seed · 100003 + row_index`), so canonical scoring and summaries are
+reproducible (and tested to be). `q_marg` is the headline AUROC score; ISR
+is the order-stability *gate* score.
+
+A throughput detail with scientific value: `p_yes_batch` scores every
+(ordering, choice) branch in fused right-padded batches and is documented —
+and engineered — to be **bit-identical on CPU** to the one-sequence-at-a-time
+path, because for a causal LM with right padding and an attention mask the
+real-position logits are unchanged. The optimization is admissible because
+it provably does not move the measurement.
+
+## Optional KV order-debias (`q_kv`)
+
+The optional fourth score reuses the repository's signature move — local
+linearization plus ridge projection (@sec-dual) — on a different control
+surface: the *value cache*. With the legacy `kv_delta_bayes_ntk` backend, it
+prefills the evidence/claim cache, builds a dense value-cache controller
+spec over `use_layers` (default 4) cache layers, computes the Jacobian
+$B$ of *centered* YES/NO event logits with respect to those controller
+coordinates, and solves
+
+$$
+\min_q\; \lVert Bq - d\rVert^2 + \rho\,\lVert q\rVert^2,
+\qquad
+\alpha = (BB^{\top} + \rho I)^{-1} d,\;\; q = B^{\top}\alpha,
+$$
+
+(local solver in `isr.py`, $\rho$ = `--kv-ridge`, default $10^{-3}$),
+where $d$ steers the event logits toward the order-marginal target
+$[\,\bar q,\, 1-\bar q\,]$ in centered log-probability coordinates. The
+resulting delta is norm-clipped (`--kv-max-norm`, default 10) before
+re-scoring, and the result records `delta_norm`, `delta_clipped`, the
+event/controller dimensions, and the clip budget. KV failures are row-local
+by default
+(`kv_status="error"`), so one cache-layout failure cannot destroy a long
+sharded run's non-KV scores.
+
+## Evaluation protocol
+
+`run_isr_auc` evaluates all scores as rankers of supported (1) vs
+unsupported (0) rows: AUROC via average ranks (tie-aware Mann–Whitney form)
+and TPR at a fixed false-positive budget (`tpr_at_leak`, default leak 0.1,
+threshold at the $(1-\text{leak})$ quantile of negative scores). Built-in
+datasets cover three regimes — VitaminC (supported/refuted claims; NEI rows
+skipped), HotpotQA-distractor (gold-support vs distractor-only rows),
+RAGTruth (balanced supported/hallucinated responses) — plus custom JSONL
+manifests with `claim`/`spans`-or-`evidence`/`supported`-or-`label` rows.
+Deterministic modulo sharding (`--shard i --nshards n`) supports long runs;
+row failures are recorded (`status="error"`) rather than aborting unless
+`--fail-fast`. Privacy default: raw claims and evidence are *omitted* from
+result JSON unless `--include-raw`.
+
+**Refutation surface** (`docs/isr_kv_verifier.md`): `q_marg` "is not a
+factuality proof," only a verifier score under sampled orderings; a
+*confidently wrong* verifier defeats ISR (low dispersion, wrong answer);
+unequal-length choice tokenizations bias sequence likelihoods (use
+`--length-normalize-choices`); the KV solve is local to the current cache
+and event projection, with large deltas clipped and disclosed; and built-in
+loaders are for reproducible research, not product evals — those should use
+explicit manifests with stable ids and dataset hashes.
+
+# Runtime, operations, and safety rails {#sec-runtime}
+
+**Hypothesis under test (H8):** request-scoped controller application can be
+made safe on a shared model, given that PyTorch hooks are model-global.
+
+## Request isolation
+
+`ControllerRuntime.apply(...)` is a context manager that loads/validates
+state(s), composes if several, builds a fresh hook module, attaches under an
+`RLock` (policy `serialize_requests=True` by default — hooks are global, so
+concurrent heterogeneous requests on one model are unsafe by construction),
+and removes hooks in `finally`. The highest-severity failure mode this
+design targets is *cross-request contamination*: one user's controller
+affecting another user's request. Consistent with that,
+`generate_batch` raises `NotImplementedError` for heterogeneous per-row
+controllers instead of silently broadcasting one controller over the batch
+— "split the batch by controller."
+
+`RuntimePolicy` is the admission knob set: `require_model_identity` (default
+on) with `allow_unknown_identity` (default on — strict mode available),
+`max_controllers` per request (default 4), optional `max_gates`, and
+`serialize_requests`.
+
+## Artifact governance
+
+Three CLI instruments gate artifacts before they reach a store or registry:
+
+- `lint` — schema validity; missing model/tokenizer revision (warning, or
+  error under `--require-revision`); gate saturation (warn when > 25% of
+  gates sit within 98% of $s_{\max}$); layer concentration (info when one
+  layer holds > 80% of gates); missing eval/safety metadata (info).
+- `card` — a Markdown controller card with identity, gate statistics,
+  layer histogram, lint findings, and optional eval/safety reports. Its
+  default limitations text restates the factual-provenance boundary. The
+  docs add: "it is not a safety proof."
+- `doctor` — pre-flight model compatibility: detected decoder layer path
+  (five known paths plus a largest-`ModuleList` fallback), hidden size,
+  tokenizer pad/EOS and chat-template status, device/dtype, supported hook
+  sites.
+
+Data-layer guardrails follow the same philosophy of failing loudly:
+`ensure_pad_token` reuses EOS but *refuses* to invent a new pad token
+(embedding resize would be a hidden model edit — an H0 violation);
+truncation keeps the right edge where completions sit and errors if no
+supervised token survives; chat rows train only on the final assistant turn
+by default, with template use explicit (`--chat-template auto|none`).
+
+## CLI as instrument panel
+
+| Command | Role in the method |
+|---|---|
+| `fit` / `eval` / `generate` / `demo` | deployable path (H1) |
+| `fit-dual` | pathwise field-locked training (H4, constructive) |
+| `secant` | initial-tangent diagnostic (H3) |
+| `dual-diagnose` | range test for duality (H4) |
+| `compose` / `compose-plan` / `inspect` | composition algebra + pre-flight (H5) |
+| `memory add/list/delete/rollback/audit/search/compose/generate/eval` | persistent memory lifecycle (H6) |
+| `isr-auc` | verifier study (H7) |
+| `lint` / `card` / `doctor` | artifact and model admission (H8) |
+
+Reproducibility and supply-chain defaults are uniform: models load with
+`trust_remote_code=False` unless explicitly overridden; `--revision` /
+`--tokenizer-revision` pin checkpoints; and the ISR adapter *raises* if the
+installed legacy backend silently ignores requested reproducibility flags
+rather than dropping them.
+
+# Benchmark methodology (not results) {#sec-benchmark}
+
+::: {.callout-important}
+The benchmark suite defines a *protocol*. The repository contains no
+committed run outputs; everything below describes what would be measured
+and which artifact would refute which claim.
+:::
+
+`run_persistent_memory_benchmark.sh` /
+`scripts/benchmark_persistent_memory_suite.py` trains one controller-backed
+memory per task (defaults: GSM8K, MBPP, HellaSwag, ARC-Easy, BoolQ; the
+paper-style small table uses `TASKS=arithmetic,gsm8k,mbpp`) and evaluates a
+five-condition design matrix per task:
+
+| Condition | What it isolates |
+|---|---|
+| `base` | the frozen model alone (floor; also the contamination check) |
+| `gold_memory` | controller quality with retrieval oracle-ed away |
+| `retrieved_descriptor_memory` | retrieval from task descriptors (diagnostic only) |
+| `retrieved_query_memory` | the realistic per-example retrieval path |
+| `composed_all_memories` | interference cost of composing everything |
+
+Comparing adjacent rows separates the two main failure axes: gold vs
+retrieved isolates *retrieval* error; base vs gold isolates *controller*
+error; retrieved vs composed isolates *composition* error. Metrics are
+teacher-forced NLL, token accuracy, and (for multiple-choice tasks)
+length-normalized choice accuracy, with summed-loss accuracy disclosed
+alongside so length bias stays visible.
+
+The suite's distinguishing feature is that the refutation controls are
+emitted as first-class outputs, one file per failure hypothesis:
+
+| Output | Failure hypothesis it tests |
+|---|---|
+| `cross_task_nll.csv` (every memory × every task) | wrong-memory harm / selectivity |
+| `selectivity_summary.csv` | gold-vs-wrong margins, worst wrong-memory harm |
+| `retrieval_recall.csv`, `retrieval_sweep.csv` (k = 1..5) | retrieval as the bottleneck |
+| `retrieval_method_comparison.csv` (lexical vs embedding vs hybrid) | descriptor lexical failure |
+| `composition_report.json`, `controller_pairwise_geometry.csv` | gate collision / interference |
+| `controller_diagnostics.csv` (norm, saturation, active gates) | saturation of the gate budget |
+| `leakage_audit.csv` (exact + 5-gram train/eval overlap) | contamination of the headline gains |
+| `per_example_retrieved_memory.csv` | per-row retrieval audit trail |
+
+`MEMORY_TEXT_MODE=descriptor_prompts` exists because of a *previously
+observed* retrieval failure mode recorded in the docs: GSM8K/BoolQ queries
+do not contain descriptor words like "grade-school" or "yes-no", so purely
+lexical descriptor retrieval fails for reasons unrelated to controller
+quality; storing prompt snippets alongside descriptors and comparing
+retrievers separates the two. The README's "Notes for benchmark claims"
+completes the protocol: always report base, controller, LoRA/SFT baseline,
+random-gate control, wrong-memory control, and no-retrieval fallback on the
+same manifest, with model/tokenizer revisions, dataset hashes, adaptation
+time, and peak memory.
+
+# Discussion {#sec-discussion}
+
+## Recurring methodological moves
+
+Four habits recur across every subsystem and constitute the repository's
+"scientific method":
+
+1. **Measure the ground truth instead of assuming the theory.** The NTK
+   target field is produced by actually stepping the weights and reversing
+   the step; the activation metric is recorded from live activations; the
+   fused ISR batcher is justified by bit-identity with the naive path, not
+   by an argument.
+2. **Give confusable failures orthogonal instruments.** Adjoint vs range vs
+   realization vs clipping in the dual; retrieval vs controller vs
+   composition in the benchmark; canonical vs marginal vs dispersion in
+   ISR. Single-number summaries are systematically refused.
+3. **Pre-flight checks before attachment.** `compose-plan` before
+   composing, `lint`/`doctor` before serving, store `audit` before
+   trusting, projection `max_dim` and `max_target_parameters` guards before
+   expensive computation.
+4. **Refutation thresholds as standing tests.** The tolerances that make a
+   diagnostic "clean" (`adjoint < 1e-5`, `range < 1e-4`, …) live in CI, not
+   in prose; clipped-vs-unclipped ordering is asserted; security
+   properties (path traversal, pickle loading, identity mismatch) are
+   tested as invariants. See Appendix B.
+
+There is also a visible *history of corrected instruments*, which is itself
+evidence the diagnostics are load-bearing: the v1 top-k projection
+double-counted the gold token (fixed and tested); the v1
+"local-controller" secant statement was demoted to a diagnostic; gate-norm
+and clip-fraction were retired as duality certificates; the diffusion gate's
+`exp` damping was replaced by `cosh` after a documented failure analysis
+(Appendix A).
+
+## Honest limitations
+
+- **No committed empirical results.** Every quantitative claim a reader
+  might want — does `fit` beat LoRA at matched budget? what AUROC does ISR
+  reach? — requires running the instruments. The repo gives the protocol
+  and the controls, not the numbers.
+- **Capability boundary.** Controllers steer behavior; they cannot supply
+  verbatim facts, citations, or fresh knowledge. The docs say this in three
+  places, and the card template repeats it per-artifact.
+- **Architecture scope.** Gating assumes a standard decoder stack
+  (five known layer paths plus a heuristic fallback); exotic architectures
+  need a layer-path extension.
+- **Serving scale.** Hook-based application is serialized per model
+  instance by default; true heterogeneous per-row serving, LoRA/PEFT
+  baseline runners, vector-DB RAG, safetensors migration, and a signed
+  controller registry are explicitly named as out-of-scope future
+  workstreams in `docs/v2_operating_layer.md`.
+- **Dual diagnostics cost.** `dual-diagnose` differentiates model weights;
+  on 7B-scale models this is expensive, and the prescribed mitigations
+  (small batches, `topk` projection, `--param-filter`) trade coverage for
+  feasibility.
+
+# Appendix A: the diffusion scale-gate Adam-M experiment {.appendix #sec-appendix-a}
+
+`scripts/diffusion/train_scale_gate_adam_m.py` is a separate research
+harness (diffusion U-Net channels, not LM decoder channels) that is
+included mainly as a worked example of the failure-analysis style. The
+original uploaded experiment used multiplicative channel gates with an
+Adam-preconditioner metric $M_t = \text{base}M \cdot e^{2q}$ and a post-Adam
+$1/\sqrt{M_t}$ step. The documented forensic chain:
+
+1. **Observed:** $q \to -\infty$ on some channels — multiplicative gates
+   self-prune unused channels (a real signal worth keeping).
+2. **Failure 1:** $e^{2q} \to 0$ made $M_t$ zero/non-finite, turning the
+   global update cap into a NaN-bypassed no-op.
+3. **Failure 2 (the naive fix):** clamping kept dead channels finite, but
+   then thousands of tiny-metric coordinates dominated the global M-norm
+   cap, converting it into a global learning-rate divider.
+4. **Diagnosis:** $e^{2q}$ is *asymmetric* — as $q\to-\infty$ the
+   post-Adam step $u/\sqrt{M_t}\to\infty$, so the optimizer amplifies
+   negative drift instead of damping it. Per the docs' recorded runs, 3–7%
+   of channels ran to $q \approx -40$; a $q_{\max}$ bound cannot fix an
+   unbounded lower tail.
+5. **Fix:** replace $e^{2q}$ with $\cosh(2q)$ (symmetric damping of
+   $|q|\to\infty$; the script's default `--m-damping cosh`), represent dead
+   channels by a *finite* `q_prune` floor (default −20) with hard-dead
+   channels getting forward scale exactly 0, exclude dead channels from the
+   active-update cap, floor the metric
+   ($M_{\mathrm{eff}} = \max(M_{\mathrm{actual}}, M_{\mathrm{floor}})$),
+   and bound one-step damage with per-coordinate
+   `max_delta_q` / `max_delta_b` caps. Global caps default *off*
+   (`--tau-q 0 --tau-b 0`) because the best uploaded run had effectively
+   bypassed its own cap.
+
+The docs include the comparison table from the uploaded runs (the one place
+the repository quotes empirical numbers, with provenance): `cosh` damping
+keeps $q \in [-5.06, +3.75]$ (original run; $[-4.70, +3.57]$ for the
+replacement script) with $0\%$ of channels beyond $|q|>5$, while `exp`
+damping runs to $q \approx -42$ with $19.7\%$ beyond. The failure
+modes section closes the loop with seven live checks (e.g., `dead_frac`
+→ 100% means the floor/LR is too aggressive; caps incrementing every step
+means the cap is again a global LR divider; DINO improving only with hard
+pruning must be reported "as structured channel pruning, not as an
+NTK-linear dual result").
+
+# Appendix B: test-suite invariant catalog {.appendix #sec-appendix-b}
+
+| Invariant | Test | Hypothesis guarded |
+|---|---|---|
+| Controller registers exactly one parameter; base layers are not children | `test_controller_does_not_register_base_layers_as_children` | H0 |
+| `evaluate_nll(use_controller=False)` restores an outer attached controller | `test_evaluate_nll_use_controller_false_detaches_outer_controller` | H0 |
+| Runtime removes hooks even on exception | `test_runtime_apply_removes_hooks_after_exception` | H0, H8 |
+| State validation rejects bad indices, NaN/Inf, duplicates, bad schema | `test_state_validation_*`, `test_load_rejects_unsupported_schema` | artifact integrity |
+| Hook applies exactly $e^{s}$ scaling for an overridden gate value ($s=0.05$ under a $0.1$ box) | `test_signed_log_override_and_state_backward_compatibility` | H1 mechanics |
+| Top-k projection never duplicates the gold token | `test_topk_projection_does_not_duplicate_gold_token`, `test_logit_topk_projection_deduplicates_gold_token` | H4 instrument |
+| Exact JVP/VJP solver: adjoint/symmetry < 1e-5, range < 1e-4, realized < 5e-3 | `test_exact_jvp_vjp_projection_solver_has_small_adjoint_and_symmetry_error` | H4 |
+| Box-clipped realization is reported and ≥ unconstrained | `test_projection_solver_reports_box_clipped_realization` | H4 honesty |
+| CG solves SPD systems to tolerance | `test_cg_solve_spd_system` | H4 solver |
+| Metric solve uses $M^{-1}$ and reports metric norm | `test_metric_projection_uses_metric_inverse_solution_shape` | H4 metric |
+| Compose sums signed log-gates; preserves hook site/theory/identity; rejects mixed hook sites and partial identity | `test_compose_*` | H5 |
+| Pair report exposes overlap | `test_pair_report_has_overlap` | H5 |
+| Memory retrieves and composes; zero-overlap returns no hits; overwrite needs explicit flag; path traversal rejected; namespaces/soft-delete/rollback/audit; orphan detection | `test_memory_*` | H6 |
+| AUROC uses average ranks for ties; TPR@leak boundary behavior; canonical scoring deterministic; row errors don't abort; ridge solve matches closed form; KV debias works on a fake backend; empty evidence rejected; custom JSONL rows parse; CLI accepts `isr-auc` | `test_isr.py` (9 tests) | H7 |
+| Runtime rejects identity mismatch, too many controllers, heterogeneous batches | `test_runtime_*` | H8 |
+| Pad token is reused, never invented | `test_ensure_pad_token_refuses_to_add_new_token_without_resize` | H0 (data layer) |
+| Chat rows parse without a template | `test_load_jsonl_examples_accepts_chat_messages_without_template` | data contract |
+| CLI maps v2 validation/retain flags and keeps the legacy KL alias | `test_cli.py` | interface stability |
+| Decoder-layer discovery and layer-spec parsing | `test_layers.py` | architecture scope |
+| Lint/card/doctor produce findings and reports | `test_artifacts.py` | H8 |
+
+*Report generated from commit `da17ca3` of the `ntkmirror` repository.
+Sources: `src/ntkmirror/*.py`, `docs/*.md`, `tests/*.py`, `scripts/*`,
+`README.md`, `pyproject.toml`.*

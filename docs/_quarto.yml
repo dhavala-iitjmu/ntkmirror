@@ -1,0 +1,55 @@
+project:
+  type: website
+
+website:
+  title: "NTK-Mirror"
+  description: "LoRA-free forward-pass fine-tuning for frozen Hugging Face causal LMs"
+  navbar:
+    background: dark
+    search: true
+    left:
+      - href: index.qmd
+        text: Home
+      - href: ntkmirror_technical_report.qmd
+        text: Technical report
+    right:
+      - icon: github
+        href: https://github.com/dhavala-iitjmu/ntkmirror
+        aria-label: GitHub
+  sidebar:
+    style: docked
+    contents:
+      - href: index.qmd
+        text: Home
+      - href: ntkmirror_technical_report.qmd
+        text: Technical report
+      - section: "Method notes"
+        contents:
+          - href: method.md
+            text: Method note
+          - href: activation_control_ntk.md
+            text: Activation-control NTK duality
+          - href: composability.md
+            text: Controller composability
+          - href: persistent_memory.md
+            text: Persistent memory controllers
+          - href: public_memory_benchmark.md
+            text: Persistent memory benchmark
+          - href: isr_kv_verifier.md
+            text: ISR verifier & KV order-debias
+          - href: v2_operating_layer.md
+            text: V2 operating layer
+          - href: diffusion_scale_gate_adam_m.md
+            text: Diffusion Adam-M scale gate
+  page-footer:
+    center: "ntkmirror — Hassana Labs. Site built with Quarto."
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-overflow: wrap
+    html-math-method: mathjax
+
+execute:
+  enabled: false
