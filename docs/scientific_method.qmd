@@ -1,0 +1,796 @@
+---
+title: "Forward-Pass Adaptation of Frozen Language Models by Sparse Signed Log-Gates"
+subtitle: "A framework-independent specification of the method"
+date: 2026-06-11
+abstract: |
+  This document specifies, in mathematical and algorithmic terms only, a family
+  of methods for adapting a frozen autoregressive language model without
+  modifying any of its weights. The core object is a sparse *signed log-gate
+  controller*: a small set of bounded scalar gates that multiplicatively
+  rescale selected hidden-state channels, $h' = e^{s}h$. Around it sit five
+  methods: (1) saliency-guided selection and gradient training of the gates;
+  (2) a measurable criterion — the *activation-control NTK duality test* — for
+  whether a gate update can realize the effect of a full-weight SGD step;
+  (3) an exact composition algebra for combining independently trained
+  controllers; (4) a retrieval-weighted scheme that turns controllers into
+  persistent behavioral memories; and (5) an order-sensitivity score for
+  evidence-support verification. Every quantity is defined precisely enough to
+  reimplement in any framework or language; no reference is made to any
+  particular software implementation.
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    html-math-method: mathjax
+execute:
+  enabled: false
+---
+
+# Setting and notation {#sec-setting}
+
+Let $f_\theta$ be a trained autoregressive (causal) language model with frozen
+parameters $\theta$, vocabulary size $V$, a stack of $L$ decoder blocks, and
+hidden width $C$. For an input token sequence, write
+$h_{\ell,t,c} \in \mathbb{R}$ for channel $c$ of the hidden-state vector at
+token position $t$ associated with block $\ell$, measured at one of two
+*intervention sites*:
+
+- **block output**: the hidden-state vector emitted by block $\ell$ into the
+  residual stream (default), or
+- **block input**: the hidden-state vector entering block $\ell$.
+
+A training example is a pair (prompt, completion). The example is tokenized as
+the concatenation of the two; prompt positions are unsupervised, completion
+positions are supervised (teacher forcing). Define the *task loss* on a batch
+as the mean next-token cross-entropy over supervised positions only:
+
+$$
+L \;=\; \frac{1}{|\mathcal{T}|}\sum_{(b,t)\in\mathcal{T}}
+-\log p_\theta\!\left(y_{b,t+1}\mid y_{b,\le t}\right),
+$$
+
+where $\mathcal{T}$ is the set of supervised (batch, position) pairs. All
+NLL ("negative log-likelihood") numbers in this document are token-weighted
+means of this quantity; *token accuracy* is the fraction of supervised
+positions where the argmax next-token prediction equals the teacher token.
+
+Throughout, "the base model" means $f_\theta$ with no intervention attached.
+A standing invariant of every method below is that **$\theta$ is never
+permanently modified**: every intervention is a removable transformation of
+hidden states, and the one procedure that does touch weights (the duality
+target measurement, @sec-target) applies a step and exactly reverses it.
+
+# The signed log-gate controller {#sec-controller}
+
+## Intervention
+
+A *controller* is a sparse set of $k$ gates. Gate $j$ addresses one pair
+$(\ell_j, c_j)$ of (block, channel), with all pairs distinct, and carries a
+bounded signed log-value $s_j$. When the controller is *attached*, the hidden
+state at the chosen site is rescaled, identically at every token position:
+
+$$
+h'_{\ell_j,\,t,\,c_j} \;=\; e^{s_j}\, h_{\ell_j,\,t,\,c_j},
+\qquad |s_j| \le s_{\max} .
+\tag{1}
+$$
+
+Unaddressed channels are untouched. The intervention is multiplicative in
+activation space and therefore *additive in log space*, which is what makes
+the composition algebra of @sec-composition exact. With the reference bound
+$s_{\max}=0.05$, every channel scale lies in
+$e^{\pm 0.05}\approx[0.951,\,1.051]$.
+
+## Parameterization
+
+The trainable parameter is an unconstrained vector $r\in\mathbb{R}^k$; the
+applied gate values are the smooth bounded reparameterization
+
+$$
+s_j \;=\; s_{\max}\tanh(r_j).
+\tag{2}
+$$
+
+This keeps every gate strictly inside $(-s_{\max}, s_{\max})$ by construction,
+so unconstrained first-order optimizers need no projection step. The inverse
+map, needed when writing externally computed gate values back into the
+parameterization, is
+
+$$
+r_j \;=\; \operatorname{atanh}\!\big(\operatorname{clip}(s_j/s_{\max},\,
+-1+\varepsilon_r,\; 1-\varepsilon_r)\big),
+\qquad \varepsilon_r = 10^{-6}.
+\tag{3}
+$$
+
+Whenever a gate-value vector is assigned from outside (composition, pathwise
+updates, deserialization), it is first clipped to $[-s_{\max}, s_{\max}]$ and
+then encoded through (3). The controller is initialized at $r=0$, i.e. the
+identity intervention.
+
+## Gate selection by first-order saliency {#sec-selection}
+
+Gates are selected before any training, from the *frozen, unmodified* model.
+The key identity: for a multiplicative log-gate inserted at $s=0$, the chain
+rule gives the loss sensitivity directly from one ordinary backward pass,
+
+$$
+\frac{\partial L}{\partial s_{\ell,c}}\bigg|_{s=0}
+\;=\;\sum_{(b,t)} \frac{\partial L}{\partial h_{\ell,b,t,c}}\;
+h_{\ell,b,t,c}.
+\tag{4}
+$$
+
+The selection statistic deliberately replaces the magnitude of this sum by the
+sum of per-position magnitudes,
+
+$$
+\sigma_{\ell,c} \;=\; \sum_{\text{batches}}\;\sum_{(b,t)}
+\left|\,\frac{\partial L}{\partial h_{\ell,b,t,c}}\; h_{\ell,b,t,c}\right|,
+\tag{5}
+$$
+
+an upper bound on $|\partial L/\partial s_{\ell,c}|$ that cannot miss a
+channel whose positive and negative token contributions cancel. The procedure:
+
+1. Fix a candidate block set $\mathcal{L}\subseteq\{0,\dots,L-1\}$ (default:
+   all blocks).
+2. For each of up to $N_{\mathrm{sel}}$ training batches (reference
+   $N_{\mathrm{sel}}=16$, batch size 8): run a forward pass capturing
+   $h_{\ell,\cdot,\cdot,\cdot}$ at the intervention site for every
+   $\ell\in\mathcal{L}$; backpropagate the task loss to those hidden states;
+   accumulate (5).
+3. Select the top $k$ (block, channel) pairs by $\sigma_{\ell,c}$, jointly
+   across all candidate blocks (reference $k = 5000$).
+
+The hidden states need a gradient source even though all weights are frozen;
+any single differentiable leaf upstream of every block suffices (e.g. the
+input embedding), and is restored to its frozen state afterwards.
+
+## Training objective {#sec-training}
+
+With the controller attached, minimize over $r$ only:
+
+$$
+L_{\mathrm{total}} \;=\; L_{\mathrm{task}}
+\;+\;\lambda_{\mathrm{ret}}\, L_{\mathrm{ret}}
+\;+\;\lambda_{\mathrm{KL}}\,
+\mathrm{KL}\!\left(P_{\mathrm{base}}\,\Vert\,P_{\mathrm{ctrl}}\right)
+\;+\;\lambda_{2}\,\frac{1}{k}\sum_j s_j^2 ,
+\tag{6}
+$$
+
+where
+
+- $L_{\mathrm{task}}$ is the supervised cross-entropy on the adaptation set;
+- $L_{\mathrm{ret}}$ is the same loss on an optional *retain* set, protecting
+  behavior the adaptation must not erase;
+- the KL term is the mean, over supervised retain positions, of
+  $\mathrm{KL}$ from the base model's next-token distribution to the
+  gated model's distribution at the same position — the base distribution is
+  computed with the intervention *temporarily removed*, so the regularizer
+  compares the same weights with and without gates;
+- the final term is a mean-square penalty on the applied gate values $s$
+  (not on $r$).
+
+Both $\lambda_{\mathrm{ret}}$ and $\lambda_{\mathrm{KL}}$ default to zero and
+require an explicit retain set when nonzero.
+
+Optimization is by an Adam-type first-order method with decoupled weight decay
+applied to $r$ alone (reference: $T=240$ steps, learning rate
+$5\times10^{-3}$, weight decay 0, batch size 8, minibatches visited in a
+fixed cyclic order: step $i$ uses batch $i \bmod n_{\mathrm{batches}}$).
+If a validation set is supplied, evaluate validation NLL every
+$V$ steps, where the default interval is $V=\max(1, \min(50, \lfloor T/10
+\rfloor))$ and always at the final step; keep the parameters that achieved
+the best validation NLL; optionally stop early after a fixed number of
+consecutive non-improving evaluations.
+
+## Artifact contract
+
+A trained controller is fully described by: the intervention site; the block
+count $L$ and hidden width $C$ it was built against; the index lists
+$\{\ell_j\}, \{c_j\}$; the parameter vector $r$ (or equivalently $s$); the
+bound $s_{\max}$; and the *identity* of the model and tokenizer it was trained
+on (name and exact revision). A controller must be refused at load time if any
+structural field disagrees with the live model, and by default if the identity
+disagrees. Validity requires: distinct (block, channel) keys, indices in
+range, finite values, $s_{\max}$ finite and positive. This contract is part of
+the method: a controller is a *measurement-bound* object, meaningful only
+against the exact network it was fitted to.
+
+## Reference hyperparameters
+
+| Quantity | Symbol | Reference value |
+|---|---|---:|
+| gate budget | $k$ | 5000 |
+| gate bound | $s_{\max}$ | 0.05 |
+| candidate blocks | $\mathcal{L}$ | all |
+| intervention site | — | block output |
+| selection batches | $N_{\mathrm{sel}}$ | 16 |
+| training steps | $T$ | 240 |
+| learning rate | — | $5\times10^{-3}$ |
+| batch size | — | 8 |
+| mean-$s^2$ penalty | $\lambda_2$ | $10^{-5}$ |
+| retain / KL weights | $\lambda_{\mathrm{ret}}, \lambda_{\mathrm{KL}}$ | 0 (opt-in) |
+
+# Activation-control NTK duality {#sec-dual}
+
+The theory-facing question is sharper than "do gates help?": **can a gate
+update reproduce, on a chosen observable, the first-order effect of a
+full-weight SGD step on the frozen model?** When it can, the controller is
+*locally dual* to weight-space fine-tuning on that observable. The method
+answers this with a measured residual, not an assumption, and explicitly
+retires two tempting but invalid certificates: a small gate norm, and
+linearity of the trained controller from its initialization (the secant
+statement of @sec-secant). The only admissible certificate is the range test
+below.
+
+## Projected logit coordinates {#sec-projection}
+
+All fields are compared in a fixed finite-dimensional projection of the
+model's supervised next-token logits, built once from a *baseline* forward
+pass on a calibration batch and then held fixed.
+
+Let $P$ be the number of supervised next-token positions in the calibration
+batch and $z_p\in\mathbb{R}^V$ the logit vector at position $p$. Each
+position's logits are first centered across the vocabulary,
+$\tilde z_p = z_p - \overline{z_p}$, so the coordinates measure distribution
+shape rather than a constant offset. Three projection modes:
+
+- **target** — one coordinate per position: the teacher-token logit
+  $\tilde z_p[y_p]$. Dimension $P$. Cheap, but tests only the teacher-token
+  direction.
+- **top-$k$** — per position, the teacher token plus the $k$ highest-scoring
+  *non-teacher* tokens of the **baseline** pass (the teacher token is excluded
+  from the top-$k$ before concatenation so it is never duplicated and never
+  double-weighted). The gathered $(k{+}1)$-vector is additionally re-centered
+  within the event set. Dimension $P(k{+}1)$. Reference $k=32$; the practical
+  default.
+- **full** — all $V$ coordinates per position. Dimension $PV$; exact but
+  large, to be guarded by an explicit dimension cap.
+
+The token index sets are frozen from the baseline pass; subsequent evaluations
+of the projection (under gates, under stepped weights) gather the same
+coordinates. Write $F(s)\in\mathbb{R}^D$ for the projected logits as a
+function of the applied gate values $s$, with weights fixed; and
+$F_\theta$ for the same map as a function of weights with gates fixed.
+
+## The measured target field {#sec-target}
+
+For support-loss gradient $g_S=\nabla_\theta L_S$ and learning rate $\eta$,
+first-order (NTK) reasoning says a full-weight SGD step displaces the
+projected calibration logits by
+
+$$
+d \;=\; -\,\eta\, J_{\theta,C}\, g_S
+\;=\; -\,\eta\, J_{\theta,C}\, J_{\theta,S}^{\top}\, g_S^{(\mathrm{out})},
+\tag{7}
+$$
+
+where $J_{\theta,C} = \partial F_\theta/\partial\theta$ on the calibration
+projection. The method does **not** trust (7) symbolically. It measures the
+displacement by actually performing a small reversible step:
+
+1. Choose the differentiated parameter subset $\Theta'$ (all parameters, or a
+   name-filtered subset such as the attention projections; a hard cap on the
+   total differentiated parameter count is recommended as a cost guard).
+2. With the controller attached at its current state, compute
+   $g=\nabla_{\Theta'} L_S$ on one support batch.
+3. Record $d_{\mathrm{base}}=F(\theta)$; apply $\theta\leftarrow\theta-\eta g$
+   in place; record $d_{\mathrm{after}}=F(\theta-\eta g)$; **restore the
+   weights exactly** by adding $\eta g$ back, with the restoration guaranteed
+   to run even if the intermediate evaluation fails.
+4. The target field is $d = d_{\mathrm{after}} - d_{\mathrm{base}}$.
+
+Reference step size $\eta = 10^{-5}$. Record alongside $d$: $\lVert g\rVert$,
+$\eta\lVert g\rVert$, $\lVert d\rVert$, and $L_S$. The step size must be swept
+in practice: too large and $d$ contains a nonlinear weight move; too small and
+$d$ drowns in numerical noise.
+
+## The gate tangent and the metric {#sec-tangent}
+
+At controller state $s_t$, define the *gate tangent*
+
+$$
+B \;=\; B(s_t) \;=\; \frac{\partial F(s)}{\partial s}\bigg|_{s=s_t}
+\;\in\;\mathbb{R}^{D\times k}.
+\tag{8}
+$$
+
+$B$ is never materialized. Two matrix-free primitives are required, both as
+exact derivatives through the same differentiable computation of $F(s)$:
+
+- $Bv$: the forward-mode directional derivative of $F$ at $s_t$ along $v$;
+- $B^\top y$: the reverse-mode gradient of $\langle F(s), y\rangle$ at $s_t$.
+
+Mixing an exact reverse-mode $B^\top$ with a finite-difference forward
+$B$ destroys the adjoint relation $\langle Bv,y\rangle=\langle v,B^\top
+y\rangle$ and with it the validity of the solver below; finite-difference
+$Bv$ is admissible only as an explicitly labeled ablation whose residuals are
+not evidence.
+
+Gate displacements are measured in a diagonal metric $M\succ 0$:
+
+- **identity** $M=I$ — an ablation, not a claim about natural units;
+- **activation** — gate displacement measured in units of induced activation
+  displacement. For a log-gate, $\delta h_{c} = e^{s_c} h_c\,\delta s_c$, so
+
+$$
+M_j \;\approx\; \mathbb{E}\big[h_{\ell_j,\cdot,c_j}^2\big]\; e^{2 s_j},
+\tag{9}
+$$
+
+  with the expectation over batch and token positions of the calibration
+  batch at gate $j$'s site. Preferred estimator: record activations *with the
+  current controller attached*, which folds the $e^{2s_j}$ factor in
+  empirically and lets upstream gates influence downstream metrics; the
+  closed-form variant records base activations and applies $e^{2s_j}$
+  explicitly. Floor every entry at $\varepsilon_M=10^{-6}$.
+
+## The ridge-projected solve {#sec-solve}
+
+The duality question — does $d$ lie in $\operatorname{range}(B)$? — is
+answered by the metric ridge projection
+
+$$
+\big(B M^{-1} B^{\top} + \lambda I\big)\,\alpha \;=\; d,
+\qquad
+u \;=\; M^{-1} B^{\top}\alpha,
+\tag{10}
+$$
+
+solved by conjugate gradients on the $D$-dimensional system using only the
+two matrix-free primitives (reference: ridge $\lambda=10^{-4}$, at most 16 CG
+iterations, relative residual tolerance $10^{-5}$). The operator
+$K=BM^{-1}B^\top+\lambda I$ is symmetric positive-definite exactly when the
+two primitives are mutually adjoint — which is *verified, not assumed*:
+
+- **adjoint probe**: draw random unit vectors $v\in\mathbb{R}^k$,
+  $y\in\mathbb{R}^D$; report the relative gap
+  $\dfrac{|\langle Bv,y\rangle-\langle v,B^{\top}y\rangle|}
+        {|\langle Bv,y\rangle|+|\langle v,B^{\top}y\rangle|}$;
+- **symmetry probe**: draw random unit $a,b\in\mathbb{R}^D$; report the same
+  relative gap between $a^{\top}Kb$ and $b^{\top}Ka$.
+
+If either probe is large, the solver is invalid and no residual from it means
+anything.
+
+## Residual taxonomy {#sec-residuals}
+
+The verdict is deliberately not one number. With $u$ from (10) and
+$\operatorname{clip}(\cdot)$ the elementwise box clip to
+$[-s_{\max},s_{\max}]$:
+
+| Diagnostic | Definition | High value means |
+|---|---|---|
+| adjoint error | probe gap above | solver invalid |
+| symmetry error | probe gap above | solver invalid |
+| CG convergence | iterations, residual history, converged flag | under-solve mimics range failure |
+| **range residual** | $\lVert d - Bu\rVert / \lVert d\rVert$ | target not in the local gate-tangent range — **the duality verdict** |
+| realized residual | $\lVert d - (F(s_t{+}u)-F(s_t))\rVert / \lVert d\rVert$ | range fine but the finite step leaves the linear regime |
+| clipped realized residual | same with $s_t{+}u$ replaced by $\operatorname{clip}(s_t{+}u)$ | what the *deployable* (bounded) update actually realizes |
+| box clip fraction | fraction of entries of $s_t{+}u$ changed by clipping (tolerance $10^{-7}$) | solved step ≠ applied step |
+| box active fraction | fraction of entries of the clipped state at the bound | budget saturated |
+| clip-update residual | $\lVert u - u_{\mathrm{applied}}\rVert/\lVert u\rVert$ | how much clipping changed the step |
+
+Cosines between $d$ and each realized field, and the norms of all fields and
+of $u$ (Euclidean and metric), are reported alongside. In a regime where the
+solve is essentially exact (small problems, full CG convergence), reference
+clean-instrument tolerances are: adjoint and symmetry errors $<10^{-5}$,
+range residual $<10^{-4}$, realized residual $<5\times10^{-3}$; and the
+clipped realized residual is never below the unconstrained one.
+
+The residual *ordering* identifies the culprit:
+
+```text
+adjoint or symmetry error high?
+└─ yes → instrument invalid (mixed-mode derivatives or a bug); fix first.
+└─ no → CG unconverged?
+    └─ yes → raise the iteration cap; an under-solve mimics range failure.
+    └─ no → range residual high?
+        └─ yes → genuine range failure on this projection.
+                 (Check the projection is not too narrow: "target" can
+                 pass while "top-k"/"full" refute.)
+        └─ no → realized residual high?
+            └─ yes → realization failure: step too large or chart too
+                     curved; sweep the target step size η.
+            └─ no → box clip fraction high?
+                └─ yes → read the clipped realized residual; the applied
+                         step is not the solved step.
+                └─ no → local duality holds on this projection.
+```
+
+## The secant diagnostic {#sec-secant}
+
+A separate, weaker instrument answers a different question: *is the trained
+controller still explained by its initialization tangent?* For a fitted gate
+vector $s$, estimate the initial tangent along the ray through the origin by
+the central difference $t=(F(\epsilon s)-F(-\epsilon s))/(2\epsilon)$ with
+$\epsilon=10^{-3}$, and for $\alpha\in\{0.125,0.25,0.5,0.75,1.0\}$ report
+
+$$
+e(\alpha)=\frac{\lVert (F(\alpha s)-F(0)) - \alpha\,t\rVert}
+               {\lVert F(\alpha s)-F(0)\rVert},
+\qquad
+\cos\big(F(\alpha s)-F(0),\;\alpha t\big),
+$$
+
+plus, at interior points $\alpha\in\{0.0625,\dots,0.875\}$, the cosine
+between the *local* central-difference derivative along the ray and the
+initial tangent $t$ ("tangent drift").
+
+**Interpretation rule (important):** a high secant error at $\alpha=1$ says
+only that the initial linearization is not a global model of the trained
+controller. It does **not** refute duality: every local field solve along the
+training path can succeed while the endpoint has left the initial tangent.
+The range residual of @sec-residuals is the duality test; the secant is a
+diagnostic of the (retired) global-linearity story.
+
+## Pathwise field-locked fitting {#sec-fitdual}
+
+The constructive counterpart of the diagnostic: instead of minimizing the
+support loss directly, repeatedly steer the gates along the measured
+full-weight field.
+
+```text
+initialize gates by saliency selection (s = 0)            # @sec-selection
+for step = 1..N:                                          # reference N = 8
+    take the next minibatch (cyclically); use it as both
+        support and calibration batch
+    build the logit projection at the current state        # @sec-projection
+    measure the target field d by the reversible
+        weight step                                        # @sec-target
+    solve (10) for the gate update u                       # @sec-solve
+    s ← clip(s + γ·u)   into [-s_max, s_max]               # reference γ = 1
+    record the full residual taxonomy, plus the realized
+        clip fraction and clip-update residual of this step
+```
+
+Each step re-linearizes both the target and the tangent at the current state,
+so the procedure tracks the weight-SGD field *pathwise*; per-step clipped
+residuals quantify exactly where the bounded gate basis stopped being able to
+follow it.
+
+# Composition algebra {#sec-composition}
+
+## Rule
+
+Because the intervention (1) multiplies channel scales, controllers compose
+by **addition of signed log-gate values on the union of their supports**:
+
+$$
+s^{(AB)}_{\ell,c} \;=\; \operatorname{clip}\!\Big(
+\sum_i w_i\, s^{(i)}_{\ell,c},\;
+-s_{\max}^{\star},\, +s_{\max}^{\star}\Big),
+\tag{11}
+$$
+
+where $s^{(i)}_{\ell,c}=0$ off controller $i$'s support, $w_i$ are scalar
+composition weights (default 1), and $s_{\max}^{\star}$ defaults to the
+largest bound among the inputs. The result is re-encoded through (3) as an
+ordinary controller. Absent clipping, attaching the composition is *exactly*
+equivalent to attaching all inputs simultaneously — this is the sense in
+which the algebra is exact, and why all interference risk concentrates in
+the clip.
+
+## Preconditions
+
+Composition must be **refused**, not coerced, unless all inputs agree on:
+hidden width $C$, block count $L$, intervention site, and the controller
+formulation version. Model/tokenizer identity must agree on an
+*all-or-none* basis: if any input declares an identity, all must declare the
+same one — a state with known identity may not be composed with one whose
+identity is unknown. The composition records its provenance (input count,
+weights, input gate counts).
+
+## Interference statistics and pre-flight thresholds
+
+For each input pair $(a,b)$, with sparse gate maps $g_a, g_b$ and dense
+vectors $v_a, v_b \in \mathbb{R}^{LC}$:
+
+- support overlap and union; Jaccard index;
+- **opposing-sign fraction**: among shared keys, the fraction with
+  $g_a\,g_b<0$;
+- $\lVert v_a\rVert$, $\lVert v_b\rVert$, $\langle v_a,v_b\rangle$, cosine.
+
+A conservative pre-flight check on a proposed composition raises a warning
+when (reference thresholds):
+
+| Signal | Trigger | Mechanical risk |
+|---|---|---|
+| saturation | $>2\%$ of union gates exceed $s_{\max}^{\star}$ *before* clipping | the sum is not what gets applied |
+| opposing overlap | $>50\%$ of any pair's shared gates have opposite signs | tasks fight over channels |
+| antagonistic direction | any pairwise cosine $< -0.1$ | globally opposed controllers |
+
+These are mechanical risk signals only; they do not certify behavioral
+compatibility. The decisive test is always behavioral: the composition must
+retain each constituent task's held-out improvement (@sec-protocol).
+Remedies, in order of preference: asymmetric weights $w_i<1$, a smaller
+$s_{\max}$, or a larger gate budget per task — *not* a larger clip bound.
+
+# Controllers as persistent behavioral memory {#sec-memory}
+
+## Model
+
+A *memory item* is a controller fitted to one unit of adaptation (a document,
+a user preference, a procedure, a task style) together with retrieval text (a
+short descriptor, optionally augmented with snippets of the item's training
+prompts) and tags. At inference time: score all items against the query,
+take the top-$k$ hits above a threshold, convert scores to composition
+weights, compose by (11), attach, generate. This trades prompt tokens for
+gate state: the forward pass is biased toward the remembered behavior without
+inserting any text into the context.
+
+## Retrieval scoring
+
+Three scorers over the items' retrieval text:
+
+- **lexical** (dependency-free baseline): tokenize to lowercase word tokens
+  with stop-words removed; with $n$ items and document frequency
+  $\mathrm{df}(t)$,
+  $$
+  \mathrm{idf}(t)=\ln\frac{1+n}{1+\mathrm{df}(t)}+1,
+  $$
+  build tf–idf vectors (term count × idf) for the query and each item; score
+  by cosine.
+- **embedding**: cosine between $\ell_2$-normalized text embeddings of query
+  and item from any sentence-embedding model.
+- **hybrid** (preferred): min–max normalize each scorer's values to $[0,1]$
+  *within the current candidate set*, then mix
+  $$
+  \mathrm{score} = \alpha\,\widehat{\mathrm{emb}} +
+  (1-\alpha)\,\widehat{\mathrm{lex}},\qquad \alpha=0.65 .
+  $$
+  Degenerate-normalization rule: if all candidates tie, map them all to $1$
+  if the tied value is positive and to $0$ otherwise — otherwise a single
+  clearly matching item would be normalized to zero and spuriously dropped.
+
+## Weighting and the no-hit fallback
+
+Hits below a strictly positive minimum score (reference $10^{-8}$) are
+discarded; **if no hit survives, no controller is attached and the base model
+answers** — a zero-signal query must never pull in an arbitrary memory.
+Surviving top-$k$ scores $c_1..c_m$ become composition weights by softmax
+with temperature $\tau=0.25$:
+
+$$
+w_i=\frac{e^{c_i/\tau}}{\sum_j e^{c_j/\tau}},
+$$
+
+(alternatives: score-proportional, uniform), so composing several memories
+interpolates rather than sums uncontrolledly. Composition then follows
+@sec-composition unchanged.
+
+## Scope boundary and trust
+
+Controller memories steer *behavior* — procedures, style, preferences, local
+terminology. They cannot insert missing strings into the context: if the
+answer requires a quote, a date, or a citation, the evidence belongs in the
+prompt (retrieval-augmented generation), not in a controller. And because a
+controller is executable-adjacent model state, a memory store is a trust
+boundary: items must be bound to the exact model/tokenizer identity, kept
+versioned and deletable, and audited — a stale, poisoned, or mismatched
+controller degrades the model silently.
+
+# Order-sensitivity verification (ISR) {#sec-isr}
+
+## Hypothesis
+
+A verifier's support probability for a *well-supported* claim should be
+stable under permutations of the evidence presentation order; instability
+signals that the verifier keys on position rather than content. Penalizing
+dispersion across orderings should therefore improve hallucination detection.
+
+## Verifier
+
+Given evidence spans $(e_1,\dots,e_n)$ and a claim, the verifier input is the
+fixed template
+
+```text
+Evidence:
+- <span 1>
+- <span 2>
+...
+Claim: <claim>
+Is the claim fully supported by the evidence? Answer YES or NO:
+```
+
+with two answer continuations, `" YES"` and `" NO"` (each with a leading
+space). The verifier score is
+
+$$
+q \;=\; P(\mathrm{YES}) \;=\;
+\operatorname{softmax}\big(\,\mathcal{L}_{\mathrm{YES}},\,
+\mathcal{L}_{\mathrm{NO}}\big)_1,
+$$
+
+where $\mathcal{L}_c$ is the sum of token log-probabilities of continuation
+$c$ appended after the template (computed in high precision). When the two
+continuations tokenize to different lengths, divide each $\mathcal{L}_c$ by
+its token count before the softmax (length normalization, opt-in).
+
+Batching note: scoring all (ordering, continuation) branches in one
+right-padded batch is admissible for a causal model with an attention mask
+because the logits at real positions are provably unchanged — an optimization
+is acceptable only when it provably does not move the measurement.
+
+## Orderings and scores
+
+For each row, with $m$ orderings (reference $m=6$): the first is the
+canonical (given) order; the remaining $m-1$ are uniform random permutations
+drawn from a deterministic per-row generator seeded by
+$\mathrm{seed}\cdot 100003 + \mathrm{row\ index}$, so every score is exactly
+reproducible and shards can be scored independently. With per-ordering
+probabilities $q_1,\dots,q_m$:
+
+$$
+q_{\mathrm{canon}}=q_1,\qquad
+q_{\mathrm{marg}}=\frac1m\sum_i q_i,\qquad
+\mathrm{ISR}=q_{\mathrm{marg}}-\beta\,\sigma(q),
+\tag{12}
+$$
+
+with $\sigma$ the population standard deviation and dispersion penalty
+$\beta=1$. $q_{\mathrm{marg}}$ is the headline ranking score;
+$\mathrm{ISR}$ is the order-stability-gated score. Known defeat: a
+*confidently wrong* verifier (low dispersion, wrong answer) passes the
+stability gate — ISR is a verifier-quality amplifier, not a factuality proof.
+
+## Evaluation metrics
+
+Scores are evaluated as rankers of supported ($y=1$) vs unsupported ($y=0$)
+rows.
+
+- **AUROC**, tie-aware (Mann–Whitney with average ranks): with average ranks
+  $R_i$ of all scores,
+  $$
+  \mathrm{AUROC}=\frac{\sum_{i:y_i=1} R_i - n_+(n_++1)/2}{n_+\,n_-}.
+  $$
+- **TPR at a false-positive budget** ("leak", reference $0.1$): sort the
+  $n_-$ negative scores ascending; the threshold is the element at index
+  $\lceil (1-\mathrm{leak})\,n_-\rceil - 1$ (clamped to a valid index;
+  leak $=0$ uses the maximum negative score); report the fraction of positive
+  scores *strictly above* the threshold.
+
+Rows that fail to score are recorded as errors and excluded rather than
+aborting the run; sharding over rows is by index modulo shard count; raw
+claim/evidence text is excluded from results by default (privacy).
+
+## Optional closed-form order-debias on the value cache
+
+A fourth score reuses the linearize-and-ridge-project move of @sec-solve on a
+different control surface: the attention *value cache* of the first few
+blocks (reference: 4), with the canonical-order input prefilled. Let
+$z_0\in\mathbb{R}^2$ be the *centered* (YES, NO) event logits, and let
+$q\mapsto z(q)$ be the event logits as a function of an additive delta $q$ on
+the chosen cache coordinates. Compute the Jacobian
+$B=\partial z/\partial q|_{q=0}\in\mathbb{R}^{2\times\dim(q)}$ by two
+reverse-mode passes; set the steering target
+
+$$
+d \;=\; \mathrm{clp}\big([\,\bar q,\;1-\bar q\,]\big)-z_0,
+$$
+
+where $\bar q = q_{\mathrm{marg}}$ and $\mathrm{clp}(p)$ is the centered
+logarithm of the probability vector $p$ clamped to
+$[\varepsilon,1-\varepsilon]$, $\varepsilon=10^{-6}$, and renormalized. Solve
+the ridge problem in closed form (in high precision):
+
+$$
+\min_q\ \lVert Bq-d\rVert^2+\rho\lVert q\rVert^2
+\;\;\Longrightarrow\;\;
+\alpha=(BB^{\top}+\rho I)^{-1}d,\quad q=B^{\top}\alpha,
+\tag{13}
+$$
+
+with $\rho=10^{-3}$; rescale $q$ to norm at most a fixed budget (reference
+10) if it exceeds it, recording that clipping occurred; re-evaluate the event
+logits with the delta applied and report
+$q_{\mathrm{kv}}=\operatorname{softmax}(z(q))_{\mathrm{YES}}$, together with
+the delta norm, the clip flag, and the solve dimensions. Single-span rows are
+skipped; a failure of this score on a row must not invalidate the row's other
+three scores.
+
+# Experimental protocol and refutation controls {#sec-protocol}
+
+The methods above come with a fixed evaluation discipline. Every positive
+claim is paired with the control that would refute it.
+
+## Reporting requirements
+
+For any adaptation claim, report on the **same** train/eval manifest, with
+pinned model and tokenizer revisions and dataset hashes:
+
+- the base model (floor, and the contamination check: if the base already
+  solves the eval, deltas are washed out);
+- the controller, across a **capacity sweep** of the gate budget $k$ — a
+  512-gate and a 10 000-gate controller are different objects;
+- a weight-space baseline (e.g. low-rank adaptation or SFT) at matched
+  budget;
+- a **random-gate control**: same budget, same training, gates chosen
+  uniformly at random — the direct refutation of the saliency-selection
+  hypothesis (@sec-selection);
+- both teacher-forced NLL **and** exact long-horizon answer accuracy: NLL can
+  improve while exact accuracy does not, and a result reported on only one is
+  incomplete;
+- for multiple-choice tasks: length-normalized choice NLL as the headline,
+  with summed-loss accuracy disclosed alongside so length bias stays visible;
+- adaptation wall-clock time and peak memory for system claims.
+
+## Memory design matrix
+
+For the persistent-memory claim, evaluate per task the five conditions:
+
+| Condition | Isolates |
+|---|---|
+| base | floor / contamination |
+| gold memory (retrieval oracle-ed away) | controller quality |
+| retrieval from task descriptors | retrieval text quality (diagnostic) |
+| per-example query retrieval | the realistic path |
+| all memories composed | interference cost |
+
+Adjacent differences separate the three failure axes: base→gold isolates the
+controller, gold→retrieved isolates retrieval, retrieved→composed isolates
+composition. Emit one artifact per failure hypothesis: every memory scored on
+every task (wrong-memory harm and selectivity margins); retrieval recall at
+$k=1..5$ for each scorer separately (a lexical-descriptor failure is not a
+controller failure); pairwise gate geometry and a composition report;
+per-controller saturation statistics; and a train/eval leakage audit (exact
+and 5-gram overlap) *before* interpreting any gain.
+
+## Standing failure-mode checklist
+
+The recurring methodological commitments, stated once:
+
+1. **Measure, don't assume.** The duality target is produced by stepping the
+   weights and reversing the step; the activation metric is recorded from
+   live activations; a batching optimization is admitted only with a proof of
+   measurement invariance.
+2. **Orthogonal instruments for confusable failures.** Adjoint vs range vs
+   realization vs clipping; retrieval vs controller vs composition; canonical
+   vs marginal vs dispersion. Never compress a verdict into one number.
+3. **No proxy certificates.** Gate norm, clip fraction, and
+   initial-tangent linearity are explicitly *not* duality certificates; the
+   range residual is.
+4. **Refuse, don't coerce.** Incompatible compositions, identity mismatches,
+   and batches mixing different controllers are rejected, not silently fixed.
+5. **Bound and disclose.** Every applied update is box-bounded, and the gap
+   between the solved and the applied update is itself a reported quantity.
+
+# Appendix: a metric for multiplicative-gate optimizers {.appendix #sec-appendix-metric}
+
+A worked failure analysis, transferable to any setting (it was observed on
+image-diffusion channel gates) where per-channel multiplicative log-gates $q$
+are trained with an adaptive optimizer whose per-coordinate metric tracks
+activation energy:
+
+$$
+M_t \;=\; M_{\mathrm{base}}\cdot\varphi(2q),
+\qquad \text{post-step preconditioner } 1/\sqrt{M_t}.
+$$
+
+With $\varphi=\exp$: multiplicative gates *self-prune* unused channels
+($q\to-\infty$ is a real signal worth keeping), but $\exp$ is asymmetric — as
+$q\to-\infty$, $M_t\to0$ and the preconditioned step $u/\sqrt{M_t}\to\infty$,
+so the optimizer **amplifies** negative drift instead of damping it (observed:
+3–7% of channels running to $q\approx-40$). A naive clamp fails the opposite
+way: thousands of finite tiny-metric dead coordinates dominate any global
+metric-norm step cap and convert it into a global learning-rate divider. An
+upper bound $q_{\max}$ cannot fix an unbounded lower tail.
+
+The repaired scheme: (i) replace $\exp(2q)$ with $\cosh(2q)$, which damps
+$|q|\to\infty$ symmetrically; (ii) represent pruned channels by a *finite*
+floor $q_{\mathrm{prune}}$ (reference $-20$), with hard-dead channels given
+forward scale exactly 0 and **excluded** from any global step-norm cap;
+(iii) floor the metric, $M_{\mathrm{eff}}=\max(M, M_{\mathrm{floor}})$;
+(iv) bound one-step damage with per-coordinate update caps, keeping global
+caps off by default. Reported effect of the $\varphi$ swap on otherwise
+identical runs: $\cosh$ keeps $q\in[-5.1,+3.8]$ with no channel beyond
+$|q|>5$; $\exp$ runs to $q\approx-42$ with $\sim$20% beyond.
+
+The general lesson matches @sec-protocol: a safety mechanism (the step cap)
+must be audited under the failure it guards against, and an improvement that
+appears only with hard pruning must be reported as structured pruning, not as
+a linear-duality result.

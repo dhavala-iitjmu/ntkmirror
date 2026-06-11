@@ -12,6 +12,8 @@ website:
         text: Home
       - href: ntkmirror_technical_report.qmd
         text: Technical report
+      - href: scientific_method.qmd
+        text: Method specification
     right:
       - icon: github
         href: https://github.com/dhavala-iitjmu/ntkmirror
@@ -23,6 +25,8 @@ website:
         text: Home
       - href: ntkmirror_technical_report.qmd
         text: Technical report
+      - href: scientific_method.qmd
+        text: Method specification
       - section: "Method notes"
         contents:
           - href: method.md
