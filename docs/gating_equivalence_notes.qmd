@@ -45,23 +45,37 @@ something different: they take the project's core hypothesis seriously
 enough to attack it — sharpening what is actually claimed, separating
 theorem from measurement, locating the genuine contribution against prior
 art, and asking what happens when the measurement returns bad news. The
-notes originate from a review hypothesis posed against the repository:
+hypothesis under examination, distilled from a review of the repository
+into four separable claims:
 
-> Instead of updating weights via LoRA or other means — $O(n^2)$ parameters
-> for $n\times n$ matrices — add a gating layer that element-wise
-> multiplies layer outputs, adding only $O(n)$ parameters. The NTK-mirror
-> theory justifies this by identifying the conditions under which the two
-> are equivalent. If correct, a simplified proof should exist. Claims that
-> the method is a "LoRA killer" or "fine-tuning free" are technically
-> incorrect: the real distinction is that the implementation can separate
-> adaptation from the base model via hooks.
+> **H1 (economy).** Adapting a model by element-wise multiplicative gating
+> of a layer's outputs costs $O(n)$ parameters per site, against $O(n^2)$
+> for an unrestricted update of an $n\times n$ weight matrix and $O(rn)$
+> for a rank-$r$ one. The gating layer is the cheap surrogate for the
+> weight update.
+>
+> **H2 (equivalence criterion).** The NTK-mirror theory is what justifies
+> the surrogacy: it identifies the conditions under which the $O(n)$ gate
+> update is equivalent to a weight update. Equivalence is conditional, not
+> universal, and the conditions are the scientific content.
+>
+> **H3 (simplified proof).** If H2 is right, the equivalence conditions
+> should admit a proof substantially simpler than the full diagnostic
+> machinery suggests.
+>
+> **H4 (framing).** The claims "LoRA killer" and "fine-tuning free" are
+> technically incorrect. The substantive distinction is operational — the
+> adaptation is separable from the base model (removable hooks) — not a
+> new kind of learning.
 
-The verdict, developed below: the hypothesis survives with two amendments
-(the comparison axis is *direction of expressivity*, not parameter count;
-and the NTK machinery is the *measuring device* for the equivalence
-conditions, not their justification), the simplified proof exists and is
-genuinely simple, and the framing corrections are warranted — with sharper
-replacements available.
+The verdict, developed below: **H1** is correct arithmetic on the wrong
+axis — the deep comparison is *direction of expressivity* (an orbit,
+transverse to low-rank), not parameter count. **H2** is right that
+equivalence is conditional, but miscasts the machinery's role: NTK-mirror
+is the *measuring device* for the conditions, not their justification.
+**H3** is confirmed — the proof is a three-rung ladder, and its core is
+four lines. **H4** is endorsed and sharpened: even separability is not
+unique to gating; the defensible distinctions lie elsewhere.
 
 # What gating is in weight space: the orbit {#sec-orbit}
 
@@ -437,17 +451,17 @@ or lightly extended toolkit:
 
 # Summary verdict {#sec-verdict}
 
-- The $O(n)$-vs-$O(n^2)$ framing is correct arithmetic but the wrong
-  axis: gating is not a smaller version of weight updating, it is a
-  **different, transverse family** — the row-scaling orbit — that can
-  only amplify or attenuate existing features.
-- The simplified proof exists: orbit identity → coherence theorem →
-  NTK specialization, with conditions C1–C4. The activation metric turns
-  out to be the choice that makes gate training literally equal
-  channel-wise regression onto the realizable component.
-- **NTK-mirror is the test, not the proof.** Tier 1 and 2 are theorems;
-  whether a task satisfies their premises is Tier 3 — an empirical,
-  batch-indexed measurement that can refute.
+- **H1, amended.** The $O(n)$-vs-$O(n^2)$ framing is correct arithmetic
+  but the wrong axis: gating is not a smaller version of weight updating,
+  it is a **different, transverse family** — the row-scaling orbit — that
+  can only amplify or attenuate existing features.
+- **H3, confirmed.** The simplified proof exists: orbit identity →
+  coherence theorem → NTK specialization, with conditions C1–C4. The
+  activation metric turns out to be the choice that makes gate training
+  literally equal channel-wise regression onto the realizable component.
+- **H2, recast.** **NTK-mirror is the test, not the proof.** Tier 1 and 2
+  are theorems; whether a task satisfies their premises is Tier 3 — an
+  empirical, batch-indexed measurement that can refute.
 - Duality is a **distribution** over data, and the deployable controller
   answers a different question than the per-batch test; mean-field
   residuals, batch-size scaling, and update dispersion are the
@@ -460,9 +474,9 @@ or lightly extended toolkit:
   hatch it has not yet generalized (additive cache deltas), and — most
   valuably — a **constructive sizing of the low-rank supplement** from the
   residual spectrum.
-- Replace "LoRA-free / fine-tuning free / LoRA killer" with:
-  *weight-preserving, orbit-restricted, detachable fine-tuning with a
-  measurable adequacy test.*
+- **H4, sharpened.** Replace "LoRA-free / fine-tuning free / LoRA killer"
+  with: *weight-preserving, orbit-restricted, detachable fine-tuning with
+  a measurable adequacy test.*
 
 # References {#sec-refs .unnumbered}
 
