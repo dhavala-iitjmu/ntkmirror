@@ -341,6 +341,14 @@ refutation of H2.
 
 # NTK dual: can gates imitate weight updates? {#sec-dual}
 
+::: {.callout-tip}
+## First-principles companion
+The terminology and derivations behind this section (NTK, mirror
+coordinates, "dual", the solver, every residual) are developed from scratch
+in [*The Activation-Control NTK Duality, From First
+Principles*](ntk_duality_first_principles.qmd).
+:::
+
 **Hypothesis under test (H3, H4):** this is the intellectual core of the
 repository. The question is not whether gates *help*, but whether the gate
 basis is *dual* to full-weight SGD — whether the projected-logit

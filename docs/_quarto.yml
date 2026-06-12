@@ -27,6 +27,8 @@ website:
         text: Technical report
       - href: scientific_method.qmd
         text: Method specification
+      - href: ntk_duality_first_principles.qmd
+        text: NTK duality from first principles
       - section: "Method notes"
         contents:
           - href: method.md

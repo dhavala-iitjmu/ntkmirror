@@ -217,6 +217,16 @@ against the exact network it was fitted to.
 
 # Activation-control NTK duality {#sec-dual}
 
+::: {.callout-tip}
+## First-principles companion
+This section states the duality test compactly. A separate report,
+[*The Activation-Control NTK Duality, From First
+Principles*](ntk_duality_first_principles.qmd), derives every quantity here
+from scratch — the NTK picture of one SGD step, the mirror coordinates, the
+Lagrangian-dual solver, the residual error terms, and a fully worked
+analytic example — with a glossary of all terminology.
+:::
+
 The theory-facing question is sharper than "do gates help?": **can a gate
 update reproduce, on a chosen observable, the first-order effect of a
 full-weight SGD step on the frozen model?** When it can, the controller is

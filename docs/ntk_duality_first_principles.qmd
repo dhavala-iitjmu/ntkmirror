@@ -1,0 +1,803 @@
+---
+title: "The Activation-Control NTK Duality, From First Principles"
+subtitle: "What it means for a log-gate controller to imitate weight-space SGD, derived step by step"
+date: 2026-06-12
+abstract: |
+  The central theoretical claim behind signed log-gate controllers is the
+  *activation-control NTK duality*: a small set of bounded multiplicative
+  gates on hidden channels can locally reproduce, on a chosen observable, the
+  effect of a full-weight stochastic-gradient step on a frozen network. This
+  report derives that claim and its test from first principles. It builds the
+  neural-tangent-kernel picture of one SGD step from a Taylor expansion;
+  explains the "mirror" coordinates in which gates live and compose; states
+  the duality as a precise range condition and gives three equivalent readings
+  of the word "dual" (a chart on behavior space, a Lagrangian dual variable,
+  and a kernel-imitation statement); derives the metric ridge-projected solver
+  and every residual it reports, including their error terms; proves why a
+  failed secant test does not refute duality; and works one analytically
+  solvable example in which every diagnostic — the tangent, the NTK, the range
+  condition, the second-order realization error, the secant error — can be
+  computed exactly by hand. A glossary fixes every term of art at first use.
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    html-math-method: mathjax
+execute:
+  enabled: false
+---
+
+# Purpose and how to read this {#sec-purpose}
+
+Two companion documents describe the method around this theory: the
+[method specification](scientific_method.qmd) gives the full
+framework-independent recipe, and the
+[technical report](ntkmirror_technical_report.qmd) maps it onto the
+implementation. Both *state* the duality test; neither derives it. This
+report is the derivation. It assumes calculus, linear algebra, and basic
+familiarity with training neural networks by gradient descent — and nothing
+about neural tangent kernels, mirror descent, or this method.
+
+The logical spine is short:
+
+1. One SGD step moves a frozen network's outputs, to first order, along a
+   computable direction — the *NTK displacement* (@sec-ntk).
+2. A log-gate controller is a tiny coordinate system ("chart") whose motions
+   also move the outputs, along the columns of a Jacobian $B$ (@sec-chart).
+3. **Duality** is the claim that direction (1) lies in the span of
+   directions (2) — a range condition, testable by a least-squares
+   projection whose residual is the verdict (@sec-duality, @sec-solver).
+4. Every reported diagnostic is an error term of that test, each with a
+   derivable meaning (@sec-residuals, @sec-secant).
+5. A one-block linear model makes every quantity exactly computable, so the
+   abstractions can be checked by hand (@sec-worked).
+
+# Glossary {#sec-glossary}
+
+Terms of art, each defined once here and used consistently after.
+
+| Term | Meaning | Where derived |
+|---|---|---|
+| frozen model | the trained network $f_\theta$; its weights $\theta$ are never permanently changed | — |
+| gate, controller | a bounded scalar $s_j$ multiplying one hidden channel by $e^{s_j}$; a controller is a sparse set of $k$ such gates | @sec-chart |
+| mirror coordinates | the additive log-space coordinates $s$ in which multiplicative channel scales become linear; the "mirror" in the method's name | @sec-mirror |
+| support batch $S$ | the training examples whose loss gradient defines the weight step being imitated (terminology from few-shot learning: the data that *supports* the adaptation) | @sec-ntk |
+| calibration batch $C$ | the examples on which the *effect* of any intervention is observed; the measurement apparatus, not the training signal | @sec-ntk |
+| observable / projection $P$ | a fixed finite list of $D$ logit coordinates on the calibration batch; all comparisons happen in $\mathbb{R}^D$ | @sec-observables |
+| target field $d$ | the measured displacement of the observable caused by one small weight-SGD step; "field" because it is defined at every controller state, like a vector field on the chart | @sec-ntk |
+| gate tangent $B$ | the $D\times k$ Jacobian of the observable with respect to the gate values, at the current state | @sec-chart |
+| chart | a smooth parameterization of a family of model behaviors; the gates are a $k$-dimensional chart, the weights a $p$-dimensional one | @sec-duality |
+| range condition / duality | the claim $d \in \operatorname{range}(B)$ (approximately, with a bounded realizing update) | @sec-duality |
+| range residual | relative distance from $d$ to $\operatorname{range}(B)$, as estimated by the ridge solve — the duality verdict | @sec-residuals |
+| realized residual | relative error after actually *taking* the solved gate step (tests chart curvature, not range) | @sec-residuals |
+| secant diagnostic | a test of whether the *trained* controller is explained by its tangent at initialization; expressly **not** a duality test | @sec-secant |
+| empirical NTK | the kernel $K = J J^{\top}$ built from output Jacobians, governing first-order output motion under gradient steps | @sec-ntk |
+| metric $M$ | the inner product in which gate motion is measured; the activation metric makes "small $u$" mean "small induced activation change" | @sec-metric |
+
+# Part I — What one SGD step does to a model's outputs {#sec-ntk}
+
+## Setup
+
+Let $f_\theta$ be the frozen network with weights $\theta \in \mathbb{R}^p$.
+Fix two batches:
+
+- the **support batch** $S$: examples with supervised completions, defining
+  a scalar training loss $L_S(\theta)$ (mean next-token cross-entropy over
+  supervised positions). This is the data an SGD step would learn from.
+- the **calibration batch** $C$: examples on which we *watch* what any
+  intervention does. Nothing is ever trained on $C$; it is the instrument.
+
+Let $z_S(\theta) \in \mathbb{R}^{D_S}$ collect the model's logit coordinates
+at the support batch's supervised positions, and
+$\Phi(\theta) \in \mathbb{R}^{D}$ collect a fixed list of $D$ logit
+coordinates on the calibration batch (the *observable*; its precise
+construction is @sec-observables). Write the two Jacobians
+
+$$
+J_S \;=\; \frac{\partial z_S}{\partial \theta} \in \mathbb{R}^{D_S\times p},
+\qquad
+J_C \;=\; \frac{\partial \Phi}{\partial \theta} \in \mathbb{R}^{D\times p}.
+$$
+
+## One SGD step, expanded to first order
+
+The support loss depends on $\theta$ only through the support logits,
+$L_S(\theta) = \ell(z_S(\theta))$, so by the chain rule the weight gradient
+factors:
+
+$$
+g_\theta \;=\; \nabla_\theta L_S \;=\; J_S^{\top} g,
+\qquad
+g \;=\; \frac{\partial \ell}{\partial z_S} \in \mathbb{R}^{D_S}.
+\tag{1}
+$$
+
+($g$ is the *output-space* error signal; for cross-entropy it is
+"predicted probabilities minus one-hot targets" at each supervised
+position.) One SGD step with learning rate $\eta$ is
+$\delta\theta = -\eta\, g_\theta = -\eta\, J_S^{\top} g$. Taylor-expand the
+observable around $\theta$:
+
+$$
+\Phi(\theta + \delta\theta) - \Phi(\theta)
+\;=\; J_C\,\delta\theta + O(\lVert\delta\theta\rVert^2)
+\;=\; \underbrace{-\,\eta\; J_C\, J_S^{\top}\, g}_{\textstyle d}
+\;+\; O(\eta^2).
+\tag{2}
+$$
+
+Equation (2) is the whole of the "NTK" content needed here. The matrix
+
+$$
+K_{CS} \;=\; J_C\, J_S^{\top} \;\in\; \mathbb{R}^{D\times D_S}
+\tag{3}
+$$
+
+is the **empirical neural tangent kernel** block between calibration and
+support coordinates (Jacot, Gabriel & Hongler 2018; Lee et al. 2019):
+entry $(a,b)$ is the inner
+product of the weight-gradients of observable coordinate $a$ and support
+coordinate $b$. Its meaning is mechanical: *training on support coordinate
+$b$ moves observable coordinate $a$ in proportion to how aligned their
+weight-sensitivities are.* To first order in $\eta$, gradient descent on the
+weights is kernel gradient descent on the outputs with kernel $K$; networks
+operating in this first-order regime are called *lazy* (Chizat, Oyallon &
+Bach 2019). We call
+
+$$
+d \;=\; -\,\eta\, K_{CS}\, g
+\tag{4}
+$$
+
+the **target field**: the function-space velocity of weight-SGD, projected
+onto the observable. "Field" because $d$ is defined at every controller
+state (the Jacobians in (3) are evaluated with the controller attached at
+its current state, so $d$ changes as the controller moves) — it assigns a
+displacement vector to each point of the gate chart, exactly like a vector
+field.
+
+## Why $d$ is measured, not computed from (4) {#sec-fd}
+
+Formula (4) is a first-order prediction. The method does not trust it: it
+*performs* the step and measures the secant,
+
+$$
+\hat d \;=\; \Phi(\theta - \eta\, g_\theta) - \Phi(\theta),
+\qquad \text{weights restored exactly afterwards.}
+\tag{5}
+$$
+
+The error structure of (5) determines how to choose $\eta$. Expanding one
+order further, with $H$ the second derivative of $\Phi$ along $g_\theta$:
+
+$$
+\hat d \;=\; -\eta\, J_C\, g_\theta
+\;+\; \tfrac{\eta^2}{2}\, H[g_\theta, g_\theta] \;+\; O(\eta^3),
+$$
+
+so the **truncation error** of treating $\hat d$ as the linear response is
+*relatively* of size $\tfrac{\eta}{2}\,\lVert H[g_\theta,g_\theta]\rVert /
+\lVert J_C g_\theta\rVert$ — it grows linearly in $\eta$. Against it stands
+the **noise floor**: $\Phi$ is computed in finite precision with absolute
+error $\sim \varepsilon\lVert\Phi\rVert$, so the relative noise on $\hat d$
+is $\sim 2\varepsilon \lVert\Phi\rVert / (\eta\lVert J_C g_\theta\rVert)$ —
+it grows as $1/\eta$. The two cross at an intermediate optimum; in practice
+one sweeps $\eta$ over a few decades and uses the plateau where
+$\hat d/\eta$ is stable. This is the derivation behind the guidance "too
+large measures a nonlinear weight move; too small drowns in noise; sweep
+it." Reference value: $\eta = 10^{-5}$, with low-precision inference dtypes
+pushing the noise floor up and demanding care.
+
+# Part II — The controller as a chart, and its mirror coordinates {#sec-chart-part}
+
+## Mirror coordinates: why gates live in log space {#sec-mirror}
+
+The intervention multiplies selected hidden channels by positive scales
+$m_j > 0$. Positive scales form a *multiplicative* group: applying scale
+$m^{(1)}$ and then $m^{(2)}$ to the same channel yields $m^{(1)}m^{(2)}$.
+The logarithm $s = \log m$ converts this group to an *additive* one:
+composition of controllers becomes vector addition, scalar weighting of a
+controller becomes scalar multiplication, and "no intervention" becomes the
+origin. The gate values $s$ are therefore the natural *linear coordinates*
+for a multiplicative intervention.
+
+This is precisely the change of variables used by **mirror descent**
+(Nemirovski & Yudin 1983; Beck & Teboulle 2003): for positive variables
+under the
+negative-entropy mirror map $\Psi(m)=\sum_c (m_c\log m_c - m_c)$, the dual
+("mirror") coordinate is $\nabla\Psi(m) = \log m$, and additive updates in
+the mirror coordinate are exponentiated-gradient / multiplicative updates in
+the primal variable (Kivinen & Warmuth 1997). The signed log-gates *are*
+mirror
+coordinates of channel scales; the box $|s_j|\le s_{\max}$ is a trust region
+imposed in mirror space; and the composition rule "add the $s$ vectors, then
+clip" is linearity in mirror coordinates. This is the **mirror** in the
+method's name. (The name carries a second, informal sense — the controller
+*mirrors* the weight-SGD field — which Part III makes precise.)
+
+## The gate chart and its tangent {#sec-chart}
+
+Fix the frozen weights and the $k$ selected (block, channel) gate sites.
+The map
+
+$$
+F:\ \mathbb{R}^k \to \mathbb{R}^D,
+\qquad
+s \;\mapsto\; \text{observable of the gated model}
+$$
+
+is a smooth, $k$-parameter family of model behaviors as seen through the
+observable — in differential-geometric language, a **chart**: a coordinate
+system on a small patch of "behavior space". The weights provide another,
+$p$-dimensional chart $\theta \mapsto \Phi(\theta)$ through the same
+observable. The duality question of Part III is whether the small chart can
+locally express a particular motion of the big one.
+
+The chart's first derivative is the **gate tangent**
+
+$$
+B(s) \;=\; \frac{\partial F(s)}{\partial s} \;\in\; \mathbb{R}^{D\times k}.
+\tag{6}
+$$
+
+Column $j$ has an explicit chain-rule form. Gate $j$ scales channel $c_j$ of
+block $\ell_j$ at every token position $t$, so perturbing $s_j$ by
+$\delta s_j$ perturbs that hidden coordinate by
+$\delta h_{\ell_j,t,c_j} = e^{s_j} h_{\ell_j,t,c_j}\,\delta s_j$
+(differentiate $e^{s}h$ in $s$), and propagates to the observable through
+the network's downstream Jacobian:
+
+$$
+B_{:,j}(s)
+\;=\;
+\sum_{t}\;
+\frac{\partial F}{\partial h_{\ell_j,t,c_j}}\;
+e^{s_j}\, h_{\ell_j,t,c_j}(s).
+\tag{7}
+$$
+
+Two facts in (7) drive everything later. First, $B$ depends on the *data*:
+a channel that is silent on the calibration batch
+($h_{\ell_j,\cdot,c_j} = 0$) contributes a zero column — that gate cannot
+move the observable at all, no matter what a weight update did to it.
+Second, $B$ depends on $s$ itself, both through the explicit $e^{s_j}$ and
+because upstream gates change the hidden states feeding downstream sites:
+the chart is *curved*, and its tangent must be re-evaluated wherever it is
+used.
+
+## Observables, and a dimension-counting warning {#sec-observables}
+
+All comparisons happen in a fixed projection of the calibration batch's
+supervised next-token logits, built once from a baseline pass: per
+supervised position, either the teacher-token coordinate (**target** mode,
+$D = P$ for $P$ positions), the teacher plus the top-$k_{\mathrm{top}}$
+baseline non-teacher tokens (**top-k** mode, $D = P(k_{\mathrm{top}}{+}1)$),
+or the whole vocabulary (**full**, $D = PV$); logits are centered per
+position so a uniform shift of all logits — which changes no probability —
+is quotiented out. (Full construction in the
+[method specification](scientific_method.qmd).)
+
+The choice of $D$ is not cosmetic; it controls whether the duality test can
+fail at all. $\operatorname{range}(B)$ is a subspace of $\mathbb{R}^D$ of
+dimension at most $\min(k, D)$:
+
+- If $D \le k$ (e.g. **target** mode with a few hundred positions against
+  $k = 5000$ gates), a generic $B$ has full row rank and its range is *all*
+  of $\mathbb{R}^D$. The range condition then holds trivially, for any
+  target whatsoever; the only informative diagnostics left are the size of
+  the realizing update and the realization/box residuals.
+- If $D \gg k$ (**top-k** or **full**), $\operatorname{range}(B)$ is a thin
+  $k$-dimensional slice of a huge space and the range condition is a real,
+  falsifiable claim.
+
+This derives, rather than merely asserts, the documented failure mode
+"projection too narrow: *target* may pass while *top-k*/*full* refutes."
+A duality claim should always be made on an observable with $D$ comfortably
+above $k$, or else accompanied by the update-norm and realization numbers.
+
+# Part III — The duality claim {#sec-duality}
+
+## Statement
+
+> **Definition (local activation-control NTK duality).** Fix the frozen
+> weights $\theta$, a controller state $s$, an observable $P$ with map $F$,
+> a support batch $S$, and a step size $\eta$. Let $d$ be the measured
+> target field (5) and $B = B(s)$ the gate tangent (6). The controller is
+> **$\epsilon$-dual to weight-SGD** at this state and observable if there
+> exists a gate update $u \in \mathbb{R}^k$ with
+> $$
+> \frac{\lVert d - B u\rVert}{\lVert d\rVert} \;\le\; \epsilon
+> \qquad\text{and}\qquad
+> s + u \in [-s_{\max}, s_{\max}]^k .
+> $$
+
+In words: *everything that one small weight-SGD step would do to the
+observable, some bounded gate motion would also do, up to relative error
+$\epsilon$.* The claim is local (it linearizes both charts at the current
+point), observable-relative (it says nothing about coordinates outside
+$P$), and data-relative (both $d$ and $B$ depend on the batches).
+
+## Three precise readings of "dual" {#sec-readings}
+
+The word is doing three jobs, all compatible.
+
+**(a) Two charts on one behavior manifold.** Weights and gates are two
+coordinate systems whose images overlap near the current behavior. Weight-SGD
+defines a velocity through the big chart; duality says the small chart's
+tangent space contains (the observable shadow of) that velocity. The gate
+chart is then a faithful local "dual description" of this particular motion
+— $k$ numbers standing in for $p$.
+
+**(b) A Lagrangian dual variable.** The natural way to *find* the
+realizing update is the smallest gate motion that does the job:
+
+$$
+\min_u\ \tfrac12\,\lVert u\rVert_M^2
+\quad\text{s.t.}\quad B u = d ,
+\tag{8}
+$$
+
+with $\lVert u\rVert_M^2 = u^{\top} M u$ for a positive diagonal metric $M$
+(@sec-metric). Form the Lagrangian
+$\mathcal{L}(u,\alpha) = \tfrac12 u^{\top}Mu - \alpha^{\top}(Bu - d)$ and set
+$\partial_u \mathcal{L} = 0$:
+
+$$
+M u = B^{\top}\alpha
+\;\;\Longrightarrow\;\;
+u = M^{-1}B^{\top}\alpha,
+\qquad
+\big(B M^{-1} B^{\top}\big)\,\alpha = d .
+\tag{9}
+$$
+
+The solver of @sec-solver is literally this **dual system**: the unknown
+$\alpha \in \mathbb{R}^D$ is the Lagrange multiplier of the constraint
+"realize the field," and the gate update is reconstructed from it. Solving
+in the dual is also the only practical choice: the dual system is
+$D\times D$ and accessed matrix-free, while the primal normal equations
+would be $k\times k$.
+
+**(c) Kernel imitation.** Define the **gate kernel**
+$K^{\mathrm{gate}} = B M^{-1} B^{\top}$ on the observable, in exact analogy
+with the weight NTK $K = J_C J_C^{\top}$. Ordinary gate training (gradient
+descent of the support loss in $s$) moves the observable along
+$-\,\eta_s\, B_C B_S^{\top} g$ — kernel descent with the *gate* kernel. The
+duality claim is that the *weight*-kernel velocity (4) lies in the range of
+the gate kernel; equivalently, gate-space dynamics can imitate weight-space
+dynamics on this observable. This sharpens the difference between the two
+training modes: standard fitting *uses* the gate kernel to reduce the loss
+(and will happily move in directions weight-SGD never would), while
+field-locked fitting (@sec-pathwise) *constrains* the motion to imitate the
+weight kernel, and the residual reports where imitation became impossible.
+
+## What duality buys, and what it does not
+
+If $\epsilon$-duality holds along a training path, then up to the
+accumulated residuals, fine-tuning *as seen through this observable* could
+have been performed by a $k$-parameter bounded, removable, composable
+intervention instead of a $p$-parameter weight update — grounding the
+practical claims (detachability, composition, memory) in the geometry of
+the frozen network rather than in luck. What it does **not** claim: nothing
+about coordinates outside the observable; nothing global in $s$ (the claim
+is re-established locally at each state); nothing about *which* $u$ ordinary
+loss-minimizing training will pick; and nothing when the box constraint is
+the binding obstruction — which is why clipping has its own diagnostics.
+
+# Part IV — Deriving the solver {#sec-solver}
+
+## From the variational problem to the implemented system
+
+Problem (8) is brittle when $d$ has a component outside
+$\operatorname{range}(B)$ — exactly the situation the test must detect — so
+it is relaxed to a penalized form that is always well-posed:
+
+$$
+u_\lambda \;=\; \arg\min_u\;
+\lVert B u - d\rVert^2 \;+\; \lambda\,\lVert u\rVert_M^2 ,
+\qquad \lambda > 0 .
+\tag{10}
+$$
+
+Setting the gradient to zero: $B^{\top}(Bu - d) + \lambda M u = 0$, i.e.
+$u_\lambda = (B^{\top}B + \lambda M)^{-1}B^{\top} d$ — a $k\times k$ system.
+The **push-through identity** converts it to the $D\times D$ dual form.
+From the algebraic identity
+
+$$
+B^{\top}\big(B M^{-1} B^{\top} + \lambda I\big)
+\;=\;
+\big(B^{\top}B + \lambda M\big)\, M^{-1} B^{\top},
+$$
+
+multiply on the left by $(B^{\top}B+\lambda M)^{-1}$ and on the right by
+$(BM^{-1}B^{\top}+\lambda I)^{-1}$:
+
+$$
+u_\lambda
+\;=\;
+M^{-1} B^{\top}
+\underbrace{\big(B M^{-1} B^{\top} + \lambda I\big)^{-1} d}_{\textstyle \alpha_\lambda}.
+\tag{11}
+$$
+
+As $\lambda \to 0^+$, $u_\lambda$ converges to the minimum-$M$-norm
+least-squares solution — the relaxation of (8) that projects $d$ onto
+$\operatorname{range}(B)$ and realizes that projection with the smallest
+gate motion. So the implemented solve answers, in one shot, both halves of
+the duality question: *how much of $d$ is reachable* (the residual) *and
+what is the cheapest way to reach it* (the update).
+
+## The activation metric as a pullback {#sec-metric}
+
+What should "small $u$" mean? Euclidean length of $s$-perturbations is
+arbitrary: a unit of $\delta s$ on a high-energy channel moves activations
+far more than the same unit on a quiet channel. The principled choice is to
+**pull back** the Euclidean metric on activations through the intervention:
+since $\delta h_{c} = e^{s_c} h_{c}\,\delta s_c$,
+
+$$
+\lVert \delta h\rVert^2
+= \sum_j \Big(\mathbb{E}\big[h_{\ell_j,\cdot,c_j}^2\big]\, e^{2 s_j}\Big)\,
+\delta s_j^2
+\;\;\Longrightarrow\;\;
+M_j = \mathbb{E}\big[h_{\ell_j,\cdot,c_j}^2\big]\, e^{2 s_j},
+\tag{12}
+$$
+
+with the expectation over the calibration batch's positions at gate $j$'s
+site. Under this $M$, the objective in (8) measures *induced activation
+displacement*, and the minimum-norm solution spends its motion where it is
+cheapest in activation units. The identity metric remains available strictly
+as an ablation. (Estimation detail: recording $\mathbb{E}[h^2]$ with the
+controller attached folds the $e^{2s_j}$ factor in empirically and captures
+upstream-gate effects on downstream sites; the closed form (12) is the
+detached approximation.)
+
+## Conjugate gradients, and why adjoint consistency is non-negotiable
+
+The dual operator $K_\lambda = BM^{-1}B^{\top} + \lambda I$ is accessed only
+through matrix–vector products built from two primitives: $v \mapsto Bv$
+(forward-mode directional derivative of $F$) and $y \mapsto B^{\top}y$
+(reverse-mode gradient of $\langle F, y\rangle$). Conjugate gradients
+converges to the solution of $K_\lambda \alpha = d$ **only if** $K_\lambda$
+is symmetric positive-definite, and $K_\lambda$ is symmetric only if the two
+primitives are exact adjoints of one another — i.e. computed from the *same*
+differentiable graph. Substituting a finite-difference forward product
+breaks the adjoint identity $\langle Bv, y\rangle = \langle v, B^{\top}y
+\rangle$ by an uncontrolled amount; CG applied to the resulting
+non-symmetric operator returns numbers, but they solve no variational
+problem, and the "residual" computed from them is not evidence about
+$\operatorname{range}(B)$. Hence the two randomized probes reported with
+every solve:
+
+$$
+\text{adjoint gap: }
+\frac{\lvert\langle Bv,y\rangle - \langle v,B^{\top}y\rangle\rvert}
+     {\lvert\langle Bv,y\rangle\rvert+\lvert\langle v,B^{\top}y\rangle\rvert},
+\qquad
+\text{symmetry gap: same form on } a^{\top}K_\lambda b \text{ vs } b^{\top}K_\lambda a,
+$$
+
+for random unit probes. A single probe is a one-sample check — it certifies
+nothing, but it *detects* gross inconsistency with high probability, which
+is its job: a gate that must be clean before any residual is read.
+
+## The ridge bias of the reported residual
+
+The reported range residual is computed at $\lambda > 0$, which biases it
+*upward*. With the whitened tangent $\tilde B = B M^{-1/2}$ and its SVD
+$\tilde B = U\Sigma V^{\top}$ (singular values $\sigma_i$), the solve gives
+$B u_\lambda = \sum_i \frac{\sigma_i^2}{\sigma_i^2+\lambda}\,
+\langle u_i, d\rangle\, u_i$, so
+
+$$
+\lVert d - B u_\lambda\rVert^2
+= \sum_i \Big(\frac{\lambda}{\sigma_i^2+\lambda}\Big)^{\!2}
+\langle u_i, d\rangle^2
+\;+\; \big\lVert (I - UU^{\top})\, d \big\rVert^2 .
+\tag{13}
+$$
+
+The second term is the *true* squared distance to the range; the first is
+ridge bias, vanishing as $\lambda \to 0$ and negligible whenever $\lambda
+\ll \sigma_i^2$ for the components that matter. Consequences worth stating:
+the reported residual is an **upper bound** on the true range distance (a
+conservative verdict — duality is never over-claimed by ridge bias); and a
+suspiciously high residual should be re-run with smaller $\lambda$ and more
+CG iterations before being believed, which is the derived content of the
+"CG under-solve mimics range failure" failure mode.
+
+# Part V — The residual ladder, term by term {#sec-residuals}
+
+The solve reports a *ladder* of residuals, each isolating one distinct way
+the duality story can break. With $u = u_\lambda$ from (11):
+
+**Range residual** $\;\lVert d - Bu\rVert / \lVert d\rVert$. The duality
+verdict itself: the (ridge-biased, hence conservative) relative distance
+from the measured weight-SGD field to the gate tangent's range. High, with
+clean probes and converged CG, on a $D \gg k$ observable: the full-weight
+step genuinely does something this gate basis cannot express. This number
+replaces two retired proxy certificates — a small gate norm and the secant
+linearity of @sec-secant — neither of which measures reachability.
+
+**Realized residual**
+$\;\lVert d - (F(s+u) - F(s))\rVert / \lVert d\rVert$. The range test
+linearizes the chart; this tests the linearization by actually taking the
+step. Taylor with remainder: if $B(\cdot)$ is $L_B$-Lipschitz near $s$,
+
+$$
+F(s+u) - F(s) \;=\; B(s)\,u + R(u),
+\qquad
+\lVert R(u)\rVert \le \tfrac12 L_B\,\lVert u\rVert^2 ,
+\tag{14}
+$$
+
+so realized $\lesssim$ range $+ \tfrac12 L_B\lVert u\rVert^2/\lVert
+d\rVert$. A low range residual with a high realized residual therefore
+means: the direction exists in the tangent, but the *finite* solved step
+left the chart's linear neighborhood — either the target step $\eta$ was too
+large (making $\lVert u\rVert$ large) or the chart is too curved here. The
+remedy (sweep $\eta$ down) follows from the error term, since
+$\lVert u\rVert$ scales linearly with $\lVert d\rVert \propto \eta$ while
+the remainder scales quadratically.
+
+**Clipped realized residual.** The deployable update is not $u$ but
+$\operatorname{clip}(s+u) - s$, because every applied controller obeys the
+box. Re-evaluating the realization after clipping gives the safety-facing
+number: what the *bounded* controller actually achieves. Reported beside it:
+the fraction of coordinates the clip changed, the fraction left sitting on
+the boundary, and $\lVert u - u_{\mathrm{applied}}\rVert / \lVert u\rVert$.
+When these are non-trivial, the box — not the geometry — is the binding
+constraint, and only the clipped number describes reality.
+
+**The decision order is forced by the derivation.** Probes validate the
+operator (else nothing downstream is defined); CG convergence validates the
+solve (else (13)'s first term is inflated by an unconverged $\alpha$);
+range is read next (the claim itself); realized next (chart curvature, per
+(14)); clipping last (feasibility). Reading them out of order — e.g.
+quoting a realized residual when the adjoint probe failed — produces
+numbers with no referent. This is the entire content of the documented
+decision tree, now derived rather than decreed.
+
+# Part VI — Secant versus pathwise duality {#sec-secant}
+
+## The secant statement and its exact error
+
+An earlier, retired formulation claimed the *trained* controller is
+explained by its initialization tangent:
+$F(s) - F(0) \approx B(0)\,s$. Call this the **secant statement** — it
+compares a finite chord of the chart to the tangent at one endpoint. The
+fundamental theorem of calculus gives the chord exactly:
+
+$$
+F(s) - F(0) \;=\; \int_0^1 B(t s)\, s \; dt ,
+\tag{15}
+$$
+
+so the secant error is
+
+$$
+F(s) - F(0) - B(0)s \;=\; \int_0^1 \big(B(ts) - B(0)\big)\, s\; dt ,
+\tag{16}
+$$
+
+— precisely the accumulated *variation of the tangent along the ray*, a
+measure of chart curvature between $0$ and $s$, and nothing else. The
+diagnostic reports the relative size of (16) at fractions
+$\alpha \in \{0.125,\dots,1\}$ of the trained gate vector, plus the cosine
+between the local tangent direction $B(\alpha s)s$ and the initial one
+("tangent drift").
+
+## Why a failed secant does not refute duality
+
+Duality is a pointwise property of the field and the tangent *at each
+state*; the secant is a property of the chart's curvature *along a finite
+path*. The two are logically independent, and (15)–(16) make the
+independence constructive: suppose at every $t\in[0,1]$ the local solve
+succeeds exactly, i.e. the local field $d(ts)$ satisfies
+$d(ts) = B(ts)\,u(ts)$ for bounded $u$. Integrating these local successes
+along the path reproduces the *entire* finite displacement as a sum of
+locally-dual moves — while the secant error (16) can simultaneously be
+arbitrarily large, because it compares against the frozen tangent $B(0)$
+rather than the moving one. A trained controller that has wandered into a
+curved region of its chart fails the secant *necessarily* and the duality
+test *not at all*. Hence the standing interpretation rule: the secant
+diagnoses the retired global-linearity story; only the range residual
+adjudicates duality.
+
+## Pathwise field-locked fitting, stated honestly {#sec-pathwise}
+
+The constructive use of the machinery replaces loss-driven training with
+field tracking: repeat { measure the local field $d^{(t)}$ at the current
+state $s_t$ (controller attached; weights stepped and restored); solve (11)
+for $u^{(t)}$; set $s_{t+1} = \operatorname{clip}(s_t + \gamma u^{(t)})$;
+record the full residual ladder }. By construction,
+
+$$
+F(s_T) - F(s_0) \;=\; \sum_{t} \big(F(s_{t+1}) - F(s_t)\big)
+\;\approx\; \sum_t d^{(t)},
+$$
+
+with per-step error exactly the recorded realized/clipped residuals. The
+honest scope of the emulation: each $d^{(t)}$ is the effect of one weight
+step *from the frozen weights, as seen by the currently-gated model* — the
+weights never accumulate. The procedure therefore tracks a sequence of
+locally-defined SGD fields, not the exact trajectory of a model whose
+weights actually move; agreement between the two is itself a first-order
+statement, and the per-step residual ledger is what bounds the gap. No
+claim beyond that ledger is made.
+
+# Part VII — A fully worked example {#sec-worked}
+
+Everything above can be checked by hand on the smallest model that has all
+the structure: **one linear block with input gates**.
+
+## Setup
+
+Input $x \in \mathbb{R}^C$, gates on all $C$ input channels, logits
+
+$$
+z(s) \;=\; W\,\big(e^{s} \odot x\big),
+\qquad W \in \mathbb{R}^{V\times C},
+$$
+
+observable $F(s) = z(s)$ on a single calibration input $x^{C}$ (take $P$ =
+identity, $D = V$), support input $x^{S}$ with cross-entropy loss against
+label $y$.
+
+## Every quantity in closed form
+
+**Gate tangent.** Differentiating coordinate-wise,
+
+$$
+B(s) = W\,\mathrm{diag}\!\big(e^{s}\odot x^{C}\big):
+\qquad
+B_{:,j}(s) = e^{s_j} x^{C}_j\; W_{:,j} .
+\tag{17}
+$$
+
+This is (7) with no depth: the downstream Jacobian is the column $W_{:,j}$
+and the local factor is $e^{s_j}x^C_j$. The data-dependence is stark: if
+$x^{C}_j = 0$, gate $j$ is a zero column — *uncontrollable on this batch* —
+regardless of its importance on the support batch.
+
+**Target field and the NTK scalar.** At gate state $s$, the support logits
+are $z^S = W(e^s\odot x^S)$, the output error is
+$g = \mathrm{softmax}(z^S) - \mathbf{1}_y$, and the weight gradient is the
+rank-one matrix $\nabla_W L = g\,(e^s \odot x^S)^{\top}$. One SGD step
+$\delta W = -\eta\, g (e^s\odot x^S)^{\top}$ displaces the calibration
+logits by
+
+$$
+d \;=\; \delta W\,(e^{s}\odot x^{C})
+\;=\; -\,\eta\;
+\underbrace{\big\langle e^{s}\odot x^{S},\; e^{s}\odot x^{C}\big\rangle}_{\textstyle \kappa}
+\; g .
+\tag{18}
+$$
+
+Equation (18) **is** equation (4) in miniature: the empirical NTK between
+the two inputs collapses to the scalar $\kappa$ (the gated-input inner
+product), and the whole displacement is the support error vector $g$ scaled
+by kernel alignment. If the support and calibration inputs share no active
+channels, $\kappa = 0$: weight-SGD does nothing to the observable, and
+duality is trivially satisfied by $u=0$.
+
+**The range condition, exactly.** By (17)–(18), duality asks whether
+
+$$
+g \;\in\; \operatorname{span}\big\{\, W_{:,j} \;:\; j \text{ selected},\;
+x^{C}_j \neq 0 \,\big\}.
+\tag{19}
+$$
+
+The exact range residual is the relative norm of the component of $g$
+orthogonal to that span. Read off the regimes derived abstractly in
+@sec-observables: with all $C$ gates selected, $x^C$ fully active, and
+$\operatorname{rank}(W) = V$ (possible when $C \ge V$), the span is all of
+$\mathbb{R}^V$ — duality holds *exactly*, residual zero. Restrict to
+$k < V$ gates and the residual is generically positive and exactly equal to
+the orthogonal mass of $g$ outside the selected columns. And under the
+**target** projection ($D = 1$: just the $y$-th logit), the condition
+collapses to "some selected $j$ has $W_{y j}\,x^C_j \neq 0$" — almost
+always true, which is the dimension-counting warning made concrete: the
+narrow observable cannot refute.
+
+**Realized residual at second order.** The chart is curved even here,
+because $z$ is linear in $e^s$, not in $s$:
+
+$$
+F(s+u) - F(s)
+= W\big(e^{s}\odot(e^{u}-1)\odot x^{C}\big)
+= B(s)\,u \;+\; \tfrac12\, W\big(e^{s}\odot u^{2}\odot x^{C}\big)
+\;+\; O(u^3),
+\tag{20}
+$$
+
+exhibiting the remainder of (14) explicitly: quadratic in $u$,
+channel-wise, amplified through $W$. With the reference box
+$s_{\max} = 0.05$, $\lvert u_j\rvert \le 0.1$ and the relative
+second-order term is at most a few percent — the analytic reason small gate
+boxes keep realized residuals near range residuals.
+
+**Secant error in closed form.** Along the ray $\alpha s$,
+$B(\alpha s) = W\,\mathrm{diag}(e^{\alpha s}\odot x^C)$, so (16) evaluates
+to $W\big((e^{\alpha s} - 1 - \alpha s)\odot x^{C}\big)$, with the scalar
+deviation $e^{\xi}-1-\xi \ge 0$ per channel: the secant error is exactly
+the summed exponential-vs-linear gap, growing quadratically in $\alpha
+\lVert s\rVert$ while every *local* solve along the ray (which uses
+$B(\alpha s)$, not $B(0)$) remains exact whenever (19) holds — a worked
+instance of "secant failure without dual failure."
+
+## What depth adds
+
+In a deep network, (17) gains a long downstream Jacobian and the hidden
+state $h(s)$ itself depends on upstream gates, so $B$ acquires
+gate–gate cross-curvature absent from the one-block model; (18)'s scalar
+$\kappa$ becomes the full NTK block, mixing all layers' parameters; and the
+span in (19) becomes a data- and state-dependent union over sites. None of
+the logic changes — only the feasibility of computing anything in closed
+form, which is precisely why the deep-network instrument is the measured,
+probe-guarded solver of Part IV rather than a formula.
+
+# Part VIII — Reading real diagnostics {#sec-reading}
+
+A compressed translation table from numbers to conclusions, each row now
+justified by a derivation above:
+
+| Observation | Conclusion | Basis |
+|---|---|---|
+| adjoint or symmetry probe large | no conclusion possible; operator invalid | @sec-solver (CG requires SPD) |
+| CG not converged | residual inflated; raise iterations, lower $\lambda$ | (13) |
+| range residual low on **target** only | weak evidence; observable too small to refute | @sec-observables dimension count; worked case (19) |
+| range low, realized high | direction reachable, step too big / chart curved; sweep $\eta$ | (14), (20) |
+| realized low, clipped high, clip fraction high | geometry fine; the *box* is the obstruction; report clipped numbers | @sec-residuals |
+| secant error high at $\alpha=1$ | chart curved along training path; says nothing about duality | (15)–(16) |
+| gate norm small | no duality evidence whatsoever | norm measures motion in the chart, not reachability of $d$ |
+| range residual high, all gates clean, $D \gg k$ | genuine refutation: weight-SGD's effect is not expressible by this gate basis here | @sec-duality |
+
+And the standing scientific posture, restated once: the duality is a
+*hypothesis with an instrument*, not an assumption of the method. The
+deployable training path never relies on it; the diagnostic path can refute
+it on any given model, data, observable, and gate budget; and every
+quantity that could silently corrupt the verdict (adjointness, convergence,
+ridge bias, curvature, clipping) is measured and reported alongside.
+
+# Limitations and open questions {#sec-limits}
+
+- **Locality.** Everything is first-order at a state. Accumulated duality
+  along long paths is controlled only by the per-step residual ledger; no
+  uniform-in-time statement is made or tested.
+- **Observable-relativity.** Duality on one projection does not imply
+  duality on a larger one (and @sec-observables shows small projections can
+  never refute). Claims should name their observable.
+- **One step, one batch.** The target is a single SGD step on one support
+  batch. Duality against an *averaged* field (full-batch gradient flow), or
+  against optimizers with state (momentum, Adam), is a strictly stronger
+  claim, not tested by this instrument.
+- **Selection coupling.** The gate basis was chosen by saliency on the same
+  loss whose SGD field it is later asked to span; the degree to which
+  selection *causes* duality (versus capacity alone) is exactly what the
+  random-gate control measures.
+- **Cost.** The target measurement differentiates model weights; the honest
+  mitigations (parameter filters, small batches, modest observables) trade
+  coverage for feasibility and should be disclosed with any claim.
+
+# References {#sec-refs .unnumbered}
+
+- Jacot, A., Gabriel, F., Hongler, C. (2018). *Neural Tangent Kernel:
+  Convergence and Generalization in Neural Networks.* NeurIPS.
+- Lee, J., Xiao, L., Schoenholz, S., Bahri, Y., Novak, R., Sohl-Dickstein,
+  J., Pennington, J. (2019). *Wide Neural Networks of Any Depth Evolve as
+  Linear Models Under Gradient Descent.* NeurIPS.
+- Chizat, L., Oyallon, E., Bach, F. (2019). *On Lazy Training in
+  Differentiable Programming.* NeurIPS.
+- Nemirovski, A., Yudin, D. (1983). *Problem Complexity and Method
+  Efficiency in Optimization.* Wiley.
+- Beck, A., Teboulle, M. (2003). *Mirror Descent and Nonlinear Projected
+  Subgradient Methods for Convex Optimization.* Operations Research
+  Letters 31(3).
+- Kivinen, J., Warmuth, M. (1997). *Exponentiated Gradient versus Gradient
+  Descent for Linear Predictors.* Information and Computation 132(1).
