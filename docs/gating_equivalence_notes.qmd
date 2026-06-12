@@ -1,0 +1,483 @@
+---
+title: "Gating as Fine-Tuning on an Orbit: Critical Commentary"
+subtitle: "What the O(n) gating hypothesis actually claims, what is provable, what is only measurable, and what to do when the measurement says no"
+date: 2026-06-13
+abstract: |
+  These notes critically examine the core hypothesis behind signed log-gate
+  controllers: that element-wise multiplicative gating of layer outputs —
+  $O(n)$ parameters per site — can stand in for weight updates that cost
+  $O(n^2)$ (full fine-tuning) or $O(rn)$ (low-rank adaptation), with the
+  NTK-mirror machinery identifying the conditions under which the two are
+  equivalent. The examination yields a layered verdict. What is provable is
+  an exact *orbit characterization*: gating equals weight updates of the
+  row-scaling form $\Delta W = (D-I)W$, nothing more, for all inputs,
+  unconditionally. What is provable *conditionally* is a four-line coherence
+  theorem: out-of-orbit updates are matched in effect exactly when the
+  task's adaptation signal is feature-proportional across the data. What
+  can only be *measured* is whether a given task satisfies those conditions
+  — and that is the true role of the NTK-mirror apparatus: a test, not a
+  proof. The notes then confront the hard questions: duality residuals vary
+  across batches (duality is a distribution, not a scalar, and the
+  deployable controller answers a different question than the per-batch
+  test); the gating idea itself is prior art (IA³, SSF, BitFit), so the
+  contribution must be located in the instrument, the task-novelty
+  reframing, and field-locked fitting; and when the residual is large the
+  method offers diagnosis plus a constructive specification of the low-rank
+  supplement — not a remedy of its own. Marketing framings ("LoRA killer",
+  "fine-tuning free") are replaced with a defensible one.
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    html-math-method: mathjax
+execute:
+  enabled: false
+---
+
+# Scope and posture {#sec-scope}
+
+This document is commentary, not specification. The
+[method specification](scientific_method.qmd) says what the system does;
+the [first-principles report](ntk_duality_first_principles.qmd) derives the
+duality machinery and works two examples in closed form. These notes do
+something different: they take the project's core hypothesis seriously
+enough to attack it — sharpening what is actually claimed, separating
+theorem from measurement, locating the genuine contribution against prior
+art, and asking what happens when the measurement returns bad news. The
+notes originate from a review hypothesis posed against the repository:
+
+> Instead of updating weights via LoRA or other means — $O(n^2)$ parameters
+> for $n\times n$ matrices — add a gating layer that element-wise
+> multiplies layer outputs, adding only $O(n)$ parameters. The NTK-mirror
+> theory justifies this by identifying the conditions under which the two
+> are equivalent. If correct, a simplified proof should exist. Claims that
+> the method is a "LoRA killer" or "fine-tuning free" are technically
+> incorrect: the real distinction is that the implementation can separate
+> adaptation from the base model via hooks.
+
+The verdict, developed below: the hypothesis survives with two amendments
+(the comparison axis is *direction of expressivity*, not parameter count;
+and the NTK machinery is the *measuring device* for the equivalence
+conditions, not their justification), the simplified proof exists and is
+genuinely simple, and the framing corrections are warranted — with sharper
+replacements available.
+
+# What gating is in weight space: the orbit {#sec-orbit}
+
+## The exact characterization
+
+Place a gate immediately after a linear map $W$ (no bias in between). For
+**every input simultaneously**:
+
+$$
+e^{s}\odot(Wx) \;=\; (DW)\,x,
+\qquad D = \mathrm{diag}(e^{s}),
+\tag{1}
+$$
+
+so gating the output of $W$ is *identically* the weight update
+$\Delta W = (D-I)\,W$ — a rescaling of the rows of the existing matrix.
+Call $\{DW : D \text{ positive diagonal}\}$ the **orbit** of $W$ under
+gating. Three structural facts follow immediately, and each corrects a
+common intuition:
+
+**Gating is not low-rank.** $(D-I)W$ has rank up to $n$. At matched
+parameter budget — rank-1 LoRA also costs $O(n)$ — the two families are
+*transverse*, not nested: rank-1 LoRA ($\Delta W = ab^{\top}$) can create
+one genuinely **new** output direction $a$, which no gate setting ever can;
+gating produces a full-rank update confined to rescalings of existing rows,
+which no rank-1 update ever can. Their intersection is the thin set of
+single-row rescalings. "Fewer parameters" is therefore not the deep
+comparison; **which directions of update space each family can reach** is.
+Gating can amplify or attenuate features the network already computes;
+it cannot rotate them or create new ones.
+
+**Homogeneous activations preserve the orbit.** For positively
+1-homogeneous $\phi$ (ReLU family), $e^{s}\odot\phi(a) =
+\phi(e^{s}\odot a)$, so a gate placed after the activation is *still*
+exactly a row-rescaling of the upstream matrix. For GELU/SiLU the identity
+is approximate (they are near-homogeneous away from the origin) — the
+orbit picture survives qualitatively but not exactly.
+
+**Normalization eats part of the orbit.** In a real transformer block, the
+gated hidden state meets an RMSNorm/LayerNorm at the next block, which
+divides out per-token scale. The *uniform* component of $e^{s}$ is
+annihilated; only the per-channel **anisotropy** survives, as a
+redirection of the residual stream inside the normalization sphere. The
+honest mental model is not "scales features" but "re-aims the residual
+stream"; effective degrees of freedom are nearer $n-1$ per site. (The
+duality instrument is immune to this — its tangent is measured through the
+true network — but intuition built on raw scaling is not.)
+
+## Two hook sites are two orbits
+
+Gating a block's *output* realizes $\Delta W = (D-I)W$ — row scaling of
+the matrix upstream. Gating a block's *input* realizes
+$\Delta W' = W'(D-I)$ — **column** scaling of the matrix downstream. These
+are different families; their union is strictly larger than either, though
+still diagonal-structured (no new directions). The hook-site ablation that
+the method prescribes for theorem-facing claims is therefore not hygiene
+but substance: it changes which orbit is being tested.
+
+# The shared-gate constraint and the simplified proof {#sec-proof}
+
+## Where the real bottleneck is
+
+Parameter count is not the binding constraint; **sharedness** is. A weight
+update $\delta W$ produces an *input-dependent additive* change
+$\delta W\,x$; a gate produces an *activation-proportional* change
+$s\odot h(x)$ with the **same** $s$ for every token and example. On one
+example the two can be matched exactly; across a distribution they
+diverge whenever different inputs demand different per-channel scalings.
+This observation yields the simplified proof the hypothesis asked for, as
+a three-rung ladder.
+
+## Rung 1 — the orbit identity (exact, global)
+
+Equation (1). Gating $\equiv$ weight updates of the form $(D-I)W$, for all
+inputs, with no conditions. One line. Equally a theorem in the other
+direction: any update *not* of this form is not exactly matched by any
+gate setting, as a function.
+
+## Rung 2 — the coherence theorem (exact, per-distribution)
+
+Let $\delta h_{jt}$ be the activation perturbation a desired update would
+induce at channel $j$, token $t$, and $h_{jt}$ the current activation. The
+best linearized gate solves a channel-separable least squares:
+
+$$
+\min_{s_j}\ \sum_t \big(\delta h_{jt} - s_j\, h_{jt}\big)^2
+\;\Longrightarrow\;
+s_j^{\star} = \frac{\sum_t h_{jt}\,\delta h_{jt}}{\sum_t h_{jt}^2},
+\qquad
+\text{residual}_j = \big(1-\rho_j^2\big)\sum_t \delta h_{jt}^2,
+\tag{2}
+$$
+
+where $\rho_j$ is the (uncentered) correlation between $h_{j\cdot}$ and
+$\delta h_{j\cdot}$ across the token distribution. **Gates realize exactly
+the component of the desired change that is proportional to what each
+channel already computes; the unrealizable energy per channel is
+$(1-\rho_j^2)$.** Four lines, no kernels, no solvers. Call $\rho_j$ the
+channel's **coherence** for this task.
+
+Two corollaries tie the method's pieces into one picture:
+
+- **Gate training *is* coherence regression.** The gate gradient at
+  $s=0$ is $\partial L/\partial s_j = \sum_t g_{jt}h_{jt}$ — the numerator
+  of $s_j^{\star}$ (with $\delta h = -g$ the steepest-descent direction in
+  activation space). Preconditioning by the activation metric
+  $M_j = \sum_t h_{jt}^2$ — i.e. natural gradient in the method's own
+  pullback metric — yields exactly $s_j^{\star}$. Ordinary gate fitting,
+  in the right metric, is channel-wise regression onto the realizable
+  component; nothing else was ever going to be learned.
+- **The saliency rule has a testable flaw.** Gate selection scores
+  channels by $\sum_t |g_{jt}h_{jt}|$. A *sign-incoherent* channel — large
+  per-token products with a cancelling sum, $\rho_j\approx 0$ — passes
+  this score while being precisely **unrealizable** by a shared gate. The
+  coherent score $|\sum_t g_{jt}h_{jt}|$, or directly
+  $\rho_j^2\times$energy, should select strictly more useful gates. This
+  is a falsifiable improvement the coherence view predicts.
+
+## Rung 3 — the NTK specialization
+
+Set $\delta h$ to the activation field induced by an actual SGD step and
+compose with the downstream Jacobian onto an observable. The
+[first-principles report](ntk_duality_first_principles.qmd) carries this
+out: the contribution of the weight matrix immediately *upstream* of a
+gate site is absorbed exactly, channel by channel (visibility and
+controllability coincide under ReLU-type activations); contributions of
+*downstream* matrices reduce to a span condition over what the gated
+channels feed into. Collecting the premises, equivalence of effect holds
+under:
+
+- **C1 (coherence):** the task's gradient field is feature-proportional at
+  the gated sites — $\rho_j \to 1$ on selected channels;
+- **C2 (readout coverage):** field components attributable to layers
+  downstream of all gates lie in the span of what the gated sites feed
+  into (gating every block puts every weight matrix upstream of some gate,
+  which is the structural fix);
+- **C3 (smallness):** the box and chart curvature keep the realized step
+  near the tangent;
+- **C4 (persistence):** C1–C3 continue to hold along the adaptation path,
+  with accumulated error bounded by the per-step residual ledger.
+
+# Theorem versus test: three tiers {#sec-tiers}
+
+The phrase "NTK-mirror justifies the equivalence" conflates three
+epistemically different layers. Keeping them separate is the single most
+important clarification of these notes.
+
+| Tier | Status | Content |
+|---|---|---|
+| 1 | **Theorem, unconditional** | the orbit identity (1): which weight updates gating matches exactly, for all inputs — and which it provably never does |
+| 2 | **Theorem, conditional** | the coherence theorem (2) and span condition: out-of-orbit updates are matched *in effect* iff C1–C2 hold |
+| 3 | **Measurement** | whether a given task, model, dataset, and observable actually satisfy C1–C4 — decided empirically, batch by batch |
+
+NTK-mirror — the measured target field, the adjoint-consistent solver, the
+residual ladder — lives entirely in **Tier 3**. It is the instrument that
+evaluates the Tier-2 premises on real networks where closed forms are
+impossible. It is *not* a proof of equivalence, and cannot be: generic
+weight updates are not in the orbit (dimension counting alone guarantees
+it), so the unconditional equivalence claim is simply false, and any
+honest theory is conditional. The machinery's virtue is exactly that it
+can **refute** — a small residual says the premises held *here*, for this
+batch, this observable, this state; a large one says this step wanted
+something no gate setting can deliver. Mathematics tells you *what kind*
+of update is matchable; the instrument tells you *whether the update your
+task actually wants is of that kind*.
+
+The reframing this licenses is worth stating: the residual does not grade
+the adapter so much as it grades the **task**. It measures how much
+genuinely new structure a task demands from a frozen model — adapter
+adequacy and task novelty are the same measurement read from opposite
+ends.
+
+# Duality is a distribution, not a scalar {#sec-distribution}
+
+Residuals vary across support and calibration batches. Once they do, "is
+this task gate-amenable?" has no single answer, and — more subtly — the
+per-batch test stops being the decision-relevant quantity.
+
+## The per-batch test answers the wrong question for a deployed controller
+
+The per-batch solve asks "*could some gate update imitate this step?*"
+The deployed object is **one** gate vector serving the whole distribution.
+The two disagree in both directions:
+
+- **Per-batch residuals can be pessimistic.** A small batch yields a
+  noisy, nearly rank-one field that points partly out of the orbit by
+  chance even when the task's *mean* field is perfectly coherent. Full
+  fine-tuning has the same phenomenon (per-batch gradient conflict); SGD
+  averages it away, and so does gate training. The decision-relevant
+  target for a static controller is the **expected** field.
+- **Per-batch residuals can be optimistic.** Every batch can pass
+  individually while each demands a *different* realizing update $u_b$.
+  No single $s$ then serves all of them: per channel, batch A wants
+  amplification where batch B wants attenuation, the shared gate fits the
+  average, and the average can be near zero — destructive interference,
+  worse than partial gains.
+
+## Three diagnostics, and the regime map
+
+| Measurement | Question answered |
+|---|---|
+| residual of the **mean field** (large or averaged support batches) | can one controller imitate the task's expected update? |
+| **residual vs. support batch size** | does per-batch failure shrink with batch size (noise) or plateau (structure)? |
+| **dispersion of per-batch realizing updates** $u_b$ (pairwise cosines) | do batches agree on *which* gate motion they want? |
+
+(Practical hygiene first: energy-weight everything by $\lVert d\rVert$ —
+a large relative residual on a near-zero field is the finite-difference
+noise floor, not evidence — and clear the boring causes: unconverged CG,
+clipping, an unrepresentative projection.)
+
+- **Regime 1 — mean-field residual small; per-batch residuals large but
+  $u_b$ consistent.** Gradient noise. The task is gate-amenable; nothing
+  is wrong; train normally.
+- **Regime 2 — $u_b$ cluster; failures concentrate on identifiable input
+  types.** The task is a *mixture* of sub-skills: within-cluster coherence
+  is high, pooled coherence is low. The correct response is architectural
+  and already exists in the system: **per-cluster controllers plus
+  retrieval** — the persistent-memory subsystem. This analysis gives that
+  subsystem a first-principles justification it did not previously have:
+  controller memory is not a storage convenience but the *correct response
+  to batch-dependent duality residuals*. Per-example residuals are
+  themselves a usable routing signal.
+- **Regime 3 — residual large even on the mean field; $u_b$ near
+  isotropic.** The task genuinely demands out-of-orbit structure: new
+  feature directions, sign flips (forbidden by $e^{s}>0$), suppression
+  beyond the box, token-position-specific edits (forbidden by
+  sharedness). No gate budget fixes this — more gates fix *coverage*
+  failures, never *coherence* failures (check which: re-run with all
+  channels gated; a surviving residual is coherence). Remedies in
+  @sec-remedies.
+
+The $u_b$-dispersion diagnostic does not exist in the repository today; it
+would be a cheap and genuinely informative addition to the dual
+diagnostics.
+
+# What, then, is the contribution? {#sec-contribution}
+
+## What is not new
+
+Element-wise multiplicative activation scaling is established PEFT prior
+art: IA³ (Liu et al., 2022) rescales keys, values, and FFN activations
+with learned vectors; SSF (Lian et al., 2022) learns per-channel scale
+*and shift*; BitFit (Ben Zaken et al., 2022) is the additive $O(n)$
+analogue; activation steering vectors are the additive activation-control
+cousin. If the claimed contribution were "adapt with $O(n)$ multiplicative
+parameters," it would be a rediscovery. Equally non-differentiating:
+log-space composition (weight deltas also add exactly in their own linear
+coordinates) and hook detachability (modern serving stacks hot-swap LoRA
+adapters too).
+
+## What is new, and worth defending
+
+1. **A family-agnostic adequacy instrument.** Nothing in the pipeline —
+   measure the true SGD field by a reversible step, build an adapter
+   family's tangent, project, read a residual ladder with validity probes
+   — is specific to gates. $B$ could be the tangent of low-rank updates,
+   biases, prefixes, or any parameterized intervention. What was built is
+   a **pre-training, measured answer to "which PEFT family suffices for
+   this task on this model?"** — a question currently settled by folklore
+   and sweeps. Instruments of this kind are real contributions; the
+   thermometer is not a theory of heat, but there is no theory of heat
+   without it.
+2. **The task-novelty reframing.** The residual quantifies, per example,
+   how much a task asks a frozen model for structure it does not already
+   have. That is a measurement with uses beyond adapter choice: routing,
+   curriculum, dataset characterization.
+3. **Field-locked fitting as a training principle.** Fitting an adapter by
+   *imitating the measured optimization field* rather than descending the
+   loss is a distinct procedure — distillation of training dynamics — and
+   is what makes per-step duality claims constructive.
+
+## Corrected framing
+
+"LoRA killer" and "fine-tuning free" should be retired. The method **is**
+fine-tuning: the gates are parameters trained by backpropagation through
+the frozen model ("forward-pass" describes serving, not fitting).
+Hook-separability is an implementation property, as the review hypothesis
+correctly noted, and is not unique. The defensible statement:
+
+> **Weight-preserving, orbit-restricted, detachable fine-tuning, with a
+> measurable adequacy test.** The update is confined to a bounded,
+> interpretable family (per-channel amplification within
+> $e^{\pm s_{\max}}$); whether that family suffices for a task is measured
+> before relying on it, not assumed.
+
+One alternative explanation must also stay on the table until tested:
+NLL gains from gate fitting may partly be a *calibration* effect
+(near-uniform late-layer scaling acts like a temperature knob), not task
+learning. The repository's own prescribed controls — random gates,
+layer-restricted gates, exact-answer metrics alongside NLL — are exactly
+the discriminating experiments; they should be reported with any claim.
+
+# When the task is out-of-orbit: remedies and non-remedies {#sec-remedies}
+
+Suppose the measurement comes back bad: large mean-field residual, the
+task demands low-rank, out-of-orbit structure. What does NTK-mirror offer?
+
+**Strictly: diagnosis, not cure.** Every deployable knob — more gates,
+bigger box, either hook site — enlarges coverage *of the orbit*, never
+escapes it. This should be said plainly. But three qualifications make
+the answer more useful than "no":
+
+1. **A remedy of degree: the hook-site union.** Output-gating and
+   input-gating are different orbits (row- vs column-scaling,
+   @sec-orbit); their union is measurably larger, and the instrument can
+   price exactly how much it buys per task.
+2. **An out-of-orbit surface already inside the system.** The
+   hallucination verifier's KV order-debias solves a per-input ridge
+   projection for a **dense additive delta on the value cache**. Additive
+   cache deltas escape both fundamental constraints: they act on silent
+   channels (not activation-proportional) and they are solved *per input*
+   (no sharedness). The system thus already contains an out-of-orbit,
+   per-request control surface — used today only inside the verifier.
+   Promoting per-request closed-form activation steering to a first-class
+   adaptation mode is the most natural internal extension; its costs
+   (per-request compute, no persistent artifact) are the honest trade.
+3. **The residual is constructive: it specifies the supplement.** The
+   unrealized component $d_\perp = d - Bu$ is a measured vector, not a
+   score. Pulled back to weight space per layer, its singular-value
+   spectrum **is** the minimal-rank requirement of the out-of-orbit part
+   of the task. The principled hybrid writes itself: *gates absorb the
+   orbit component at $O(n)$; a low-rank adapter is fitted to the residual
+   field with rank read off its spectrum rather than guessed; the same
+   instrument then re-certifies the combined tangent
+   $[\,B_{\mathrm{gate}}\,|\,B_{\mathrm{lora}}\,]$.* In this design LoRA
+   is not a competitor to be killed but the component the instrument
+   **prescribes and sizes** when gates are not enough. A gentler in-family
+   step exists too: per-channel additive shifts alongside scales
+   (SSF-style) break activation-proportionality without leaving $O(n)$ —
+   and the repository's diffusion experiment already trains shifts; the
+   language-model path simply never adopted them.
+
+The mature claim, replacing the marketing one: **spend the adaptation
+budget where the measured field says the structure is — and here is the
+device that measures it.**
+
+# Falsifiable predictions and proposed instruments {#sec-predictions}
+
+Concrete consequences of this analysis, each testable with the existing
+or lightly extended toolkit:
+
+1. **Coherence profile (new, cheap).** One backward pass recording $h$ and
+   $\partial L/\partial h$ per site; report the $\rho_j^2$-weighted
+   realizable energy fraction per layer. This is the duality residual
+   specialized to the activation observable — no JVP, no CG — and should
+   *predict before fitting* whether a task is gate-amenable. Prediction:
+   tasks with a high coherence fraction at salient sites show NLL gains
+   from gate fitting; low-coherence tasks do not.
+2. **Coherent saliency (modification).** Select gates by
+   $|\sum_t g_{jt}h_{jt}|$ (or $\rho_j^2\times$energy) instead of
+   $\sum_t|g_{jt}h_{jt}|$. Prediction: matched-budget controllers improve,
+   most on tasks with many sign-incoherent channels.
+3. **$u_b$-dispersion diagnostic (new).** Report pairwise cosines of
+   per-batch realizing updates alongside the residuals. Prediction: it
+   separates mixture tasks (Regime 2 — fix with memory routing) from
+   noise (Regime 1) and from genuine out-of-orbit demand (Regime 3) where
+   the residual alone cannot.
+4. **Residual-vs-batch-size curve (protocol).** Prediction: noise-driven
+   residuals decay with support batch size; structural ones plateau.
+5. **Task-class predictions.** Gate-amenable: style, register, format,
+   calibration, domain emphasis, procedure priming — distribution-level
+   reweighting of existing features. Gate-resistant: new factual bindings,
+   new token mappings, counterfactual re-binding, edits requiring sign
+   flips or >$\,e^{s_{\max}}{-}1$ suppression, token-position-specific
+   corrections. Note that the resistant list independently re-derives the
+   project's documented memory-scope boundary ("behavior, not facts") —
+   theory and operating guidance agree, which is evidence the theory is
+   tracking the right mechanism.
+6. **Calibration control.** Compare full controllers against
+   late-layer-only and uniform-scale controllers on exact-answer metrics.
+   Prediction: if gains are calibration, the restricted variants match on
+   NLL but not on exact answers.
+
+# Summary verdict {#sec-verdict}
+
+- The $O(n)$-vs-$O(n^2)$ framing is correct arithmetic but the wrong
+  axis: gating is not a smaller version of weight updating, it is a
+  **different, transverse family** — the row-scaling orbit — that can
+  only amplify or attenuate existing features.
+- The simplified proof exists: orbit identity → coherence theorem →
+  NTK specialization, with conditions C1–C4. The activation metric turns
+  out to be the choice that makes gate training literally equal
+  channel-wise regression onto the realizable component.
+- **NTK-mirror is the test, not the proof.** Tier 1 and 2 are theorems;
+  whether a task satisfies their premises is Tier 3 — an empirical,
+  batch-indexed measurement that can refute.
+- Duality is a **distribution** over data, and the deployable controller
+  answers a different question than the per-batch test; mean-field
+  residuals, batch-size scaling, and update dispersion are the
+  decision-relevant statistics. Mixture-type failures are the
+  first-principles justification for the controller-memory subsystem.
+- The gating mechanism is prior art; the durable contributions are the
+  **family-agnostic adequacy instrument**, the **task-novelty
+  reframing**, and **field-locked fitting**.
+- For out-of-orbit tasks the method offers diagnosis, a per-input escape
+  hatch it has not yet generalized (additive cache deltas), and — most
+  valuably — a **constructive sizing of the low-rank supplement** from the
+  residual spectrum.
+- Replace "LoRA-free / fine-tuning free / LoRA killer" with:
+  *weight-preserving, orbit-restricted, detachable fine-tuning with a
+  measurable adequacy test.*
+
+# References {#sec-refs .unnumbered}
+
+- Liu, H., Tam, D., Muqeeth, M., Mohta, J., Huang, T., Bansal, M.,
+  Raffel, C. (2022). *Few-Shot Parameter-Efficient Fine-Tuning is Better
+  and Cheaper than In-Context Learning* (IA³). NeurIPS.
+- Lian, D., Zhou, D., Feng, J., Wang, X. (2022). *Scaling & Shifting Your
+  Features: A New Baseline for Efficient Model Tuning* (SSF). NeurIPS.
+- Ben Zaken, E., Ravfogel, S., Goldberg, Y. (2022). *BitFit: Simple
+  Parameter-efficient Fine-tuning for Transformer-based Masked
+  Language-models.* ACL.
+- Hu, E., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang,
+  L., Chen, W. (2022). *LoRA: Low-Rank Adaptation of Large Language
+  Models.* ICLR.
+- Jacot, A., Gabriel, F., Hongler, C. (2018). *Neural Tangent Kernel:
+  Convergence and Generalization in Neural Networks.* NeurIPS.
+- Chizat, L., Oyallon, E., Bach, F. (2019). *On Lazy Training in
+  Differentiable Programming.* NeurIPS.

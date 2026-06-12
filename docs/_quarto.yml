@@ -29,6 +29,8 @@ website:
         text: Method specification
       - href: ntk_duality_first_principles.qmd
         text: NTK duality from first principles
+      - href: gating_equivalence_notes.qmd
+        text: "Gating equivalence: critical notes"
       - section: "Method notes"
         contents:
           - href: method.md

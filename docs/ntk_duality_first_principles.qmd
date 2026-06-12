@@ -1279,6 +1279,16 @@ ridge bias, curvature, clipping) is measured and reported alongside.
 
 # Limitations and open questions {#sec-limits}
 
+::: {.callout-tip}
+## Critical commentary
+A companion document, [*Gating as Fine-Tuning on an Orbit*
+](gating_equivalence_notes.qmd), develops the limitations below into a
+full critical examination: the exact orbit characterization, a simplified
+three-rung proof, the theorem-vs-test distinction, duality as a
+distribution over batches, prior-art positioning, and remedies when the
+residual is large.
+:::
+
 - **Locality.** Everything is first-order at a state. Accumulated duality
   along long paths is controlled only by the per-step residual ledger; no
   uniform-in-time statement is made or tested.
